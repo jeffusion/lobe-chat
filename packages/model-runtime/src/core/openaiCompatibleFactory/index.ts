@@ -31,6 +31,7 @@ import type {
   CreateVideoResponse,
   HandleCreateVideoWebhookPayload,
   HandleCreateVideoWebhookResult,
+  PollVideoStatusResult,
 } from '../../types/video';
 import { AgentRuntimeError } from '../../utils/createError';
 import { debugResponse, debugStream } from '../../utils/debugStream';
@@ -38,7 +39,9 @@ import { desensitizeUrl } from '../../utils/desensitizeUrl';
 import { getModelPropertyWithFallback } from '../../utils/getFallbackModelProperty';
 import { getModelPricing } from '../../utils/getModelPricing';
 import { handleOpenAIError } from '../../utils/handleOpenAIError';
+import { isAccountDeactivatedError } from '../../utils/isAccountDeactivatedError';
 import { isExceededContextWindowError } from '../../utils/isExceededContextWindowError';
+import { isInsufficientQuotaError } from '../../utils/isInsufficientQuotaError';
 import { isQuotaLimitError } from '../../utils/isQuotaLimitError';
 import { postProcessModelList } from '../../utils/postProcessModelList';
 import { StreamingResponse } from '../../utils/response';
@@ -50,8 +53,11 @@ import { OpenAIResponsesStream, OpenAIStream } from '../streams';
 import type { ChatPayloadForTransformStream } from '../streams/protocol';
 import { convertOpenAIResponseUsage, convertOpenAIUsage } from '../usageConverters/openai';
 import { createOpenAICompatibleImage } from './createImage';
+import { createOpenAICompatibleVideo, pollOpenAICompatibleVideoStatus } from './createVideo';
 import { transformResponseAPIToStream, transformResponseToStream } from './nonStreamToStream';
 
+export type { PollVideoStatusResult };
+export * from './createVideo';
 export * from './nonStreamToStream';
 
 // the model contains the following keywords is not a chat model, so we should filter them out
@@ -68,6 +74,12 @@ export const CHAT_MODELS_BLOCK_LIST = [
 ];
 
 type ConstructorOptions<T extends Record<string, any> = any> = ClientOptions & T;
+type OpenAIExtraParams = { prompt_cache_key?: string; safety_identifier?: string };
+type ResponseCreateParamsWithPromptCacheKey = (
+  | OpenAI.Responses.ResponseCreateParamsStreaming
+  | OpenAI.Responses.ResponseCreateParams
+) &
+  OpenAIExtraParams;
 export type CreateImageOptions = Omit<ClientOptions, 'apiKey'> & {
   apiKey: string;
   provider: string;
@@ -169,6 +181,10 @@ export interface OpenAICompatibleFactoryOptions<T extends Record<string, any> = 
     payload: HandleCreateVideoWebhookPayload,
     options: CreateVideoOptions,
   ) => Promise<HandleCreateVideoWebhookResult>;
+  handlePollVideoStatus?: (
+    inferenceId: string,
+    options: CreateVideoOptions,
+  ) => Promise<PollVideoStatusResult>;
   models?:
     | ((params: { client: OpenAI }) => Promise<ChatModelCard[]>)
     | {
@@ -197,6 +213,7 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
   createImage: customCreateImage,
   createVideo: customCreateVideo,
   handleCreateVideoWebhook: customHandleCreateVideoWebhook,
+  handlePollVideoStatus: customHandlePollVideoStatus,
   generateObject: generateObjectConfig,
 }: OpenAICompatibleFactoryOptions<T>) => {
   const ErrorType = {
@@ -335,6 +352,27 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
       return false;
     }
 
+    private resolvePromptCacheKey(model?: string, user?: string) {
+      if (!user) return;
+
+      // Keep the default key at {userId}:{model}; {agentId} can be added later if a narrower cache bucket is needed.
+      if (model?.startsWith('gpt-') || /^o\d/.test(model || '') || model === 'chat-latest') {
+        return `lobe:${user}:${model}`;
+      }
+    }
+
+    private resolvePromptCacheKeyParams(
+      model?: string,
+      user?: string,
+      existingPromptCacheKey?: string,
+    ) {
+      if (existingPromptCacheKey !== undefined) return {};
+
+      const promptCacheKey = this.resolvePromptCacheKey(model, user);
+
+      return promptCacheKey ? { prompt_cache_key: promptCacheKey } : {};
+    }
+
     async chat({ responseMode, ...payload }: ChatStreamPayload, options?: ChatMethodOptions) {
       try {
         const log = debug(`${this.logPrefix}:chat`);
@@ -435,6 +473,7 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
         const messages = await convertOpenAIMessages(postPayload.messages, {
           forceImageBase64: chatCompletion?.forceImageBase64,
           forceVideoBase64: chatCompletion?.forceVideoBase64,
+          model: postPayload.model,
         });
 
         let response: Stream<OpenAI.Chat.Completions.ChatCompletionChunk>;
@@ -473,6 +512,11 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
             ...cleanedPayload,
             messages,
             ...(chatCompletion?.noUserId ? {} : { user: options?.user }),
+            ...this.resolvePromptCacheKeyParams(
+              cleanedPayload.model,
+              options?.user,
+              cleanedPayload.prompt_cache_key,
+            ),
             stream_options:
               postPayload.stream && !chatCompletion?.excludeUsage
                 ? { include_usage: true }
@@ -573,12 +617,22 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
     }
 
     async createVideo(payload: CreateVideoPayload) {
-      if (!customCreateVideo) {
-        throw new Error('createVideo is not supported by this provider');
+      const log = debug(`${this.logPrefix}:createVideo`);
+
+      if (customCreateVideo) {
+        log('using custom createVideo implementation');
+        return customCreateVideo(payload, {
+          ...this._options,
+          apiKey: this._options.apiKey!,
+          provider,
+        });
       }
-      return customCreateVideo(payload, {
+
+      log('using default createOpenAICompatibleVideo');
+      return createOpenAICompatibleVideo(payload, {
         ...this._options,
         apiKey: this._options.apiKey!,
+        baseURL: this._options.baseURL || '',
         provider,
       });
     }
@@ -590,6 +644,27 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
       return customHandleCreateVideoWebhook(payload, {
         ...this._options,
         apiKey: this._options.apiKey!,
+        provider,
+      });
+    }
+
+    async handlePollVideoStatus(inferenceId: string): Promise<PollVideoStatusResult> {
+      const log = debug(`${this.logPrefix}:handlePollVideoStatus`);
+
+      if (customHandlePollVideoStatus) {
+        log('using custom handlePollVideoStatus implementation');
+        return customHandlePollVideoStatus(inferenceId, {
+          ...this._options,
+          apiKey: this._options.apiKey!,
+          provider,
+        });
+      }
+
+      log('using default pollOpenAICompatibleVideoStatus');
+      return pollOpenAICompatibleVideoStatus(inferenceId, {
+        ...this._options,
+        apiKey: this._options.apiKey!,
+        baseURL: this._options.baseURL || '',
         provider,
       });
     }
@@ -704,6 +779,7 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
             {
               messages,
               model,
+              ...this.resolvePromptCacheKeyParams(model, options?.user),
               tool_choice: { function: { name: tool.function.name }, type: 'function' },
               tools: [tool],
               user: options?.user,
@@ -758,9 +834,11 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
             {
               input: messages,
               model,
+              ...this.resolvePromptCacheKeyParams(model, options?.user),
               text: { format: { strict: true, type: 'json_schema', ...processedSchema } },
-              user: options?.user,
-            },
+              // Responses API replaced `user` with `safety_identifier`; some endpoints reject `user`
+              safety_identifier: options?.user,
+            } as any,
             { headers: options?.headers, signal: options?.signal },
           );
 
@@ -787,6 +865,7 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
             messages,
             model,
             response_format: { json_schema: processedSchema, type: 'json_schema' },
+            ...this.resolvePromptCacheKeyParams(model, options?.user),
             user: options?.user,
           },
           { headers: options?.headers, signal: options?.signal },
@@ -921,21 +1000,9 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
         }
       }
 
-      const { errorResult, RuntimeError } = handleOpenAIError(error);
+      const { errorResult, RuntimeError, message } = handleOpenAIError(error);
 
       log('error code: %s, message: %s', errorResult.code, errorResult.message);
-
-      // Check for "Insufficient Balance" in error message
-      const errorMessage = errorResult.error?.message || errorResult.message;
-      if (errorMessage?.includes('Insufficient Balance')) {
-        log('insufficient balance error detected in message');
-        return AgentRuntimeError.chat({
-          endpoint: desensitizedEndpoint,
-          error: errorResult,
-          errorType: AgentRuntimeErrorType.InsufficientQuota,
-          provider: this.id,
-        });
-      }
 
       switch (errorResult.code) {
         case 'insufficient_quota': {
@@ -944,6 +1011,7 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
             endpoint: desensitizedEndpoint,
             error: errorResult,
             errorType: AgentRuntimeErrorType.InsufficientQuota,
+            message,
             provider: this.id,
           });
         }
@@ -954,6 +1022,7 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
             endpoint: desensitizedEndpoint,
             error: errorResult,
             errorType: AgentRuntimeErrorType.ModelNotFound,
+            message,
             provider: this.id,
           });
         }
@@ -966,18 +1035,43 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
             endpoint: desensitizedEndpoint,
             error: errorResult,
             errorType: AgentRuntimeErrorType.ExceededContextWindow,
+            message,
             provider: this.id,
           });
         }
       }
 
       const errorMsg = errorResult.error?.message || errorResult.message;
+
+      if (isAccountDeactivatedError(errorMsg)) {
+        log('account deactivated error detected from message');
+        return AgentRuntimeError.chat({
+          endpoint: desensitizedEndpoint,
+          error: errorResult,
+          errorType: AgentRuntimeErrorType.AccountDeactivated,
+          message,
+          provider: this.id,
+        });
+      }
+
+      if (isInsufficientQuotaError(errorMsg)) {
+        log('insufficient quota error detected from message');
+        return AgentRuntimeError.chat({
+          endpoint: desensitizedEndpoint,
+          error: errorResult,
+          errorType: AgentRuntimeErrorType.InsufficientQuota,
+          message,
+          provider: this.id,
+        });
+      }
+
       if (isExceededContextWindowError(errorMsg)) {
         log('context length exceeded detected from message');
         return AgentRuntimeError.chat({
           endpoint: desensitizedEndpoint,
           error: errorResult,
           errorType: AgentRuntimeErrorType.ExceededContextWindow,
+          message,
           provider: this.id,
         });
       }
@@ -988,6 +1082,7 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
           endpoint: desensitizedEndpoint,
           error: errorResult,
           errorType: AgentRuntimeErrorType.QuotaLimitReached,
+          message,
           provider: this.id,
         });
       }
@@ -997,6 +1092,7 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
         endpoint: desensitizedEndpoint,
         error: errorResult,
         errorType: RuntimeError || ErrorType.bizError,
+        message,
         provider: this.id,
       });
     }
@@ -1047,15 +1143,21 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
         input,
         ...(max_tokens && { max_output_tokens: max_tokens }),
         store: false,
-        stream: !isStreaming ? undefined : isStreaming,
+        stream: isStreaming || undefined,
         tools: tools?.map((tool) => this.convertChatCompletionToolToResponseTool(tool)),
-        user: options?.user,
+        ...this.resolvePromptCacheKeyParams(
+          res.model,
+          options?.user,
+          (res as OpenAIExtraParams).prompt_cache_key,
+        ),
+        // Responses API replaced `user` with `safety_identifier`; some endpoints reject `user`
+        safety_identifier: options?.user,
         // Sanitize sampling params for Responses API path
         ...resolveModelSamplingParameters(res.model, res, {
           normalizeTemperature: false,
           preferTemperature: true,
         }),
-      } as OpenAI.Responses.ResponseCreateParamsStreaming | OpenAI.Responses.ResponseCreateParams;
+      } as ResponseCreateParamsWithPromptCacheKey;
 
       if (debugParams?.responses?.()) {
         // eslint-disable-next-line no-console
@@ -1172,10 +1274,12 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
           {
             input,
             model,
+            ...this.resolvePromptCacheKeyParams(model, options?.user),
             tool_choice: 'required',
             tools: tools!.map((tool) => this.convertChatCompletionToolToResponseTool(tool)),
-            user: options?.user,
-          },
+            // Responses API replaced `user` with `safety_identifier`; some endpoints reject `user`
+            safety_identifier: options?.user,
+          } as any,
           { headers: options?.headers, signal: options?.signal },
         );
 
@@ -1212,6 +1316,7 @@ export const createOpenAICompatibleRuntime = <T extends Record<string, any> = an
         {
           messages: msgs,
           model,
+          ...this.resolvePromptCacheKeyParams(model, options?.user),
           tool_choice: 'required',
           tools,
           user: options?.user,

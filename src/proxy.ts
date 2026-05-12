@@ -32,10 +32,12 @@ export const config = {
     '/share(.*)',
 
     '/onboarding',
+    '/onboarding(.*)',
 
     '/signup(.*)',
     '/signin(.*)',
     '/verify-email(.*)',
+    '/verify-im(.*)',
     '/reset-password(.*)',
     '/auth-error(.*)',
     '/oauth(.*)',

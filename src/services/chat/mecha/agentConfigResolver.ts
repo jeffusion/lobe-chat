@@ -1,6 +1,7 @@
 import { type BuiltinAgentSlug } from '@lobechat/builtin-agents';
 import { BUILTIN_AGENT_SLUGS, getAgentRuntimeConfig } from '@lobechat/builtin-agents';
 import { PageAgentIdentifier } from '@lobechat/builtin-tool-page-agent';
+import { TaskIdentifier } from '@lobechat/builtin-tool-task';
 import { type LobeToolManifest } from '@lobechat/context-engine';
 import {
   type ChatCompletionTool,
@@ -15,6 +16,9 @@ import { getAgentStoreState } from '@/store/agent';
 import { agentSelectors, chatConfigByIdSelectors } from '@/store/agent/selectors';
 import { getChatGroupStoreState } from '@/store/agentGroup';
 import { agentGroupByIdSelectors, agentGroupSelectors } from '@/store/agentGroup/selectors';
+import { useUserStore } from '@/store/user';
+import { userGeneralSettingsSelectors } from '@/store/user/selectors';
+import { isDev } from '@/utils/env';
 
 const log = debug('mecha:agentConfigResolver');
 
@@ -158,7 +162,14 @@ export const resolveAgentConfig = (ctx: AgentConfigResolverContext): ResolvedAge
       log('disableTools is true, returning empty plugins');
       return [];
     }
-    return isSubTask ? pluginIds.filter((id) => id !== 'lobe-gtd') : pluginIds;
+
+    let nextPluginIds = pluginIds;
+
+    if (ctx.scope !== 'page') {
+      nextPluginIds = nextPluginIds.filter((id) => id !== PageAgentIdentifier);
+    }
+
+    return isSubTask ? nextPluginIds.filter((id) => id !== 'lobe-gtd') : nextPluginIds;
   };
 
   const agentStoreState = getAgentStoreState();
@@ -186,10 +197,10 @@ export const resolveAgentConfig = (ctx: AgentConfigResolverContext): ResolvedAge
       ctx.groupId,
       group
         ? {
-          groupId: group.id,
-          supervisorAgentId: group.supervisorAgentId,
-          title: group.title,
-        }
+            groupId: group.id,
+            supervisorAgentId: group.supervisorAgentId,
+            title: group.title,
+          }
         : null,
       agentId,
     );
@@ -225,8 +236,24 @@ export const resolveAgentConfig = (ctx: AgentConfigResolverContext): ResolvedAge
     // Regular agent - use provided plugins if available, fallback to agent's plugins
     const finalPlugins = plugins && plugins.length > 0 ? plugins : basePlugins;
 
+    // Inject response language preference into system role for regular agents
+    const userLocale = userGeneralSettingsSelectors.currentResponseLanguage(
+      useUserStore.getState(),
+    );
+    const localeInstruction = userLocale
+      ? `Preferred reply language: ${userLocale}. Use this language unless the user explicitly asks to switch.`
+      : '';
+    const systemRoleWithLocale = localeInstruction
+      ? agentConfig.systemRole
+        ? `${agentConfig.systemRole}\n\n${localeInstruction}`
+        : localeInstruction
+      : agentConfig.systemRole;
+
     // Apply params adjustments based on chatConfig
-    let finalAgentConfig = applyParamsFromChatConfig(agentConfig, chatConfig);
+    let finalAgentConfig = applyParamsFromChatConfig(
+      { ...agentConfig, systemRole: systemRoleWithLocale },
+      chatConfig,
+    );
     let finalChatConfig = chatConfig;
 
     // === Page Editor Auto-Injection ===
@@ -242,13 +269,13 @@ export const resolveAgentConfig = (ctx: AgentConfigResolverContext): ResolvedAge
       const pageAgentRuntime = getAgentRuntimeConfig(BUILTIN_AGENT_SLUGS.pageAgent, {});
       const pageAgentSystemRole = pageAgentRuntime?.systemRole || '';
 
-      // 3. Merge system roles: custom agent's role + page-agent role
+      // 3. Merge system roles: custom agent's role (with locale) + page-agent role
       // Only append page-agent role if it exists
       const mergedSystemRole = pageAgentSystemRole
-        ? agentConfig.systemRole
-          ? `${agentConfig.systemRole}\n\n${pageAgentSystemRole}`
+        ? systemRoleWithLocale
+          ? `${systemRoleWithLocale}\n\n${pageAgentSystemRole}`
           : pageAgentSystemRole
-        : agentConfig.systemRole || '';
+        : systemRoleWithLocale || '';
 
       finalAgentConfig = {
         ...finalAgentConfig,
@@ -266,6 +293,31 @@ export const resolveAgentConfig = (ctx: AgentConfigResolverContext): ResolvedAge
         chatConfig: finalChatConfig,
         isBuiltinAgent: false,
         plugins: applyPluginFilters(pageAgentPlugins),
+      };
+    }
+
+    if (ctx.scope === 'task') {
+      const taskAgentPlugins = finalPlugins.includes(TaskIdentifier)
+        ? finalPlugins
+        : [TaskIdentifier, ...finalPlugins];
+      const taskAgentRuntime = getAgentRuntimeConfig(BUILTIN_AGENT_SLUGS.taskAgent, {});
+      const taskAgentSystemRole = taskAgentRuntime?.systemRole || '';
+      const mergedSystemRole = taskAgentSystemRole
+        ? systemRoleWithLocale
+          ? `${systemRoleWithLocale}\n\n${taskAgentSystemRole}`
+          : taskAgentSystemRole
+        : systemRoleWithLocale || '';
+
+      finalAgentConfig = {
+        ...finalAgentConfig,
+        systemRole: mergedSystemRole,
+      };
+
+      return {
+        agentConfig: finalAgentConfig,
+        chatConfig: finalChatConfig,
+        isBuiltinAgent: false,
+        plugins: applyPluginFilters(taskAgentPlugins),
       };
     }
 
@@ -292,11 +344,11 @@ export const resolveAgentConfig = (ctx: AgentConfigResolverContext): ResolvedAge
       ctx.groupId,
       group
         ? {
-          agentsCount: group.agents?.length,
-          groupId: group.id,
-          supervisorAgentId: group.supervisorAgentId,
-          title: group.title,
-        }
+            agentsCount: group.agents?.length,
+            groupId: group.id,
+            supervisorAgentId: group.supervisorAgentId,
+            title: group.title,
+          }
         : null,
     );
 
@@ -331,9 +383,11 @@ export const resolveAgentConfig = (ctx: AgentConfigResolverContext): ResolvedAge
   const runtimeConfig = getAgentRuntimeConfig(slug, {
     documentContent,
     groupSupervisorContext,
+    isDev,
     model,
     plugins: plugins || basePlugins,
     targetAgentConfig,
+    userLocale: userGeneralSettingsSelectors.currentResponseLanguage(useUserStore.getState()),
   });
 
   // Merge runtime systemRole into agent config
@@ -376,6 +430,21 @@ export const resolveAgentConfig = (ctx: AgentConfigResolverContext): ResolvedAge
       ...resolvedChatConfig,
       enableHistoryCount: false,
     };
+  }
+
+  if (ctx.scope === 'task' && slug !== BUILTIN_AGENT_SLUGS.taskAgent) {
+    if (!finalPlugins.includes(TaskIdentifier)) {
+      finalPlugins = [TaskIdentifier, ...finalPlugins];
+    }
+
+    const taskAgentRuntime = getAgentRuntimeConfig(BUILTIN_AGENT_SLUGS.taskAgent, {});
+    const taskAgentSystemRole = taskAgentRuntime?.systemRole || '';
+
+    if (taskAgentSystemRole) {
+      resolvedSystemRole = resolvedSystemRole
+        ? `${resolvedSystemRole}\n\n${taskAgentSystemRole}`
+        : taskAgentSystemRole;
+    }
   }
 
   // Merge runtime systemRole into agent config

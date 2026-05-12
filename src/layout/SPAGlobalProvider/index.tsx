@@ -8,8 +8,10 @@ import { lazy, memo, type PropsWithChildren, Suspense, useLayoutEffect } from 'r
 import { LobeAnalyticsProviderWrapper } from '@/components/Analytics/LobeAnalyticsProviderWrapper';
 import { DragUploadProvider } from '@/components/DragUploadZone/DragUploadProvider';
 import { isDesktop } from '@/const/version';
+import AgentMockDevtools from '@/features/AgentMockDevtools';
 import AuthProvider from '@/layout/AuthProvider';
 import AppTheme from '@/layout/GlobalProvider/AppTheme';
+import DynamicFavicon from '@/layout/GlobalProvider/DynamicFavicon';
 import { FaviconProvider } from '@/layout/GlobalProvider/FaviconProvider';
 import { GroupWizardProvider } from '@/layout/GlobalProvider/GroupWizardProvider';
 import ImportSettings from '@/layout/GlobalProvider/ImportSettings';
@@ -23,7 +25,10 @@ import type { SPAServerConfig } from '@/types/spaServerConfig';
 import Locale from './Locale';
 
 const ModalHost = lazy(() => import('@lobehub/ui').then((m) => ({ default: m.ModalHost })));
-const ToastHost = lazy(() => import('@lobehub/ui').then((m) => ({ default: m.ToastHost })));
+const BaseModalHost = lazy(() =>
+  import('@lobehub/ui/base-ui').then((m) => ({ default: m.ModalHost })),
+);
+const ToastHost = lazy(() => import('@lobehub/ui/base-ui').then((m) => ({ default: m.ToastHost })));
 const ContextMenuHost = lazy(() =>
   import('@lobehub/ui').then((m) => ({ default: m.ContextMenuHost })),
 );
@@ -54,6 +59,7 @@ const SPAGlobalProvider = memo<PropsWithChildren>(({ children }) => {
 
                 {isDesktop && <ServerVersionOutdatedAlert />}
                 <FaviconProvider>
+                  <DynamicFavicon />
                   <GroupWizardProvider>
                     <DragUploadProvider>
                       <LazyMotion features={domMax}>
@@ -64,6 +70,7 @@ const SPAGlobalProvider = memo<PropsWithChildren>(({ children }) => {
                         </TooltipGroup>
                         <Suspense>
                           <ModalHost />
+                          <BaseModalHost />
                           <ToastHost />
                           <ContextMenuHost />
                         </Suspense>
@@ -76,6 +83,7 @@ const SPAGlobalProvider = memo<PropsWithChildren>(({ children }) => {
             <Suspense>
               <ImportSettings />
               {/* DevPanel disabled in SPA: depends on node:fs */}
+              {process.env.NODE_ENV === 'development' && <AgentMockDevtools />}
             </Suspense>
           </ServerConfigStoreProvider>
         </AppTheme>

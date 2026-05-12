@@ -80,6 +80,7 @@ export class UserModel {
     const result = await this.db
       .select({
         avatar: users.avatar,
+        agentOnboarding: users.agentOnboarding,
         email: users.email,
         firstName: users.firstName,
         fullName: users.fullName,
@@ -97,6 +98,7 @@ export class UserModel {
         settingsLanguageModel: userSettings.languageModel,
         settingsMarket: userSettings.market,
         settingsMemory: userSettings.memory,
+        settingsNotification: userSettings.notification,
         settingsSystemAgent: userSettings.systemAgent,
         settingsTTS: userSettings.tts,
         settingsTool: userSettings.tool,
@@ -131,6 +133,7 @@ export class UserModel {
       languageModel: state.settingsLanguageModel || {},
       market: state.settingsMarket || undefined,
       memory: state.settingsMemory || {},
+      notification: state.settingsNotification || {},
       systemAgent: state.settingsSystemAgent || {},
       tool: state.settingsTool || {},
       tts: state.settingsTTS || {},
@@ -138,6 +141,7 @@ export class UserModel {
 
     return {
       avatar: state.avatar || undefined,
+      agentOnboarding: state.agentOnboarding || undefined,
       email: state.email || undefined,
       firstName: state.firstName || undefined,
       fullName: state.fullName || undefined,

@@ -2,13 +2,19 @@ import { getBuiltinIntervention } from '@lobechat/builtin-tools/interventions';
 import { safeParseJSON } from '@lobechat/utils';
 import { Flexbox } from '@lobehub/ui';
 import { memo, Suspense, useCallback, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 import { useUserStore } from '@/store/user';
 import { toolInterventionSelectors } from '@/store/user/selectors';
 
-import { useConversationStore } from '../../../../../store';
+import { dataSelectors, useConversationStore } from '../../../../../store';
 import Arguments from '../Arguments';
 import ApprovalActions from './ApprovalActions';
+import {
+  isCustomInteractionIdentifier,
+  prepareCustomInteractionSubmit,
+  recordCustomInteractionResolution,
+} from './customInteractionHandlers';
 import Fallback from './Fallback';
 import KeyValueEditor from './KeyValueEditor';
 import SecurityBlacklistWarning from './SecurityBlacklistWarning';
@@ -16,7 +22,9 @@ import SecurityBlacklistWarning from './SecurityBlacklistWarning';
 export type { ApprovalMode } from '@/store/user/slices/settings/selectors';
 
 interface InterventionProps {
+  actionsPortalTarget?: HTMLDivElement | null;
   apiName: string;
+  assistantGroupId?: string;
   id: string;
   identifier: string;
   requestArgs: string;
@@ -24,7 +32,7 @@ interface InterventionProps {
 }
 
 const Intervention = memo<InterventionProps>(
-  ({ requestArgs, id, identifier, apiName, toolCallId }) => {
+  ({ requestArgs, id, identifier, apiName, toolCallId, assistantGroupId, actionsPortalTarget }) => {
     const approvalMode = useUserStore(toolInterventionSelectors.approvalMode);
     const [isEditing, setIsEditing] = useState(false);
     const updatePluginArguments = useConversationStore((s) => s.updatePluginArguments);
@@ -84,6 +92,68 @@ const Intervention = memo<InterventionProps>(
 
     const parsedArgs = useMemo(() => safeParseJSON(requestArgs || '') ?? {}, [requestArgs]);
 
+    const isCustomInteraction = isCustomInteractionIdentifier(identifier);
+
+    const topicId = useConversationStore((s) => dataSelectors.getDbMessageById(id)(s)?.topicId);
+    const submitToolInteraction = useConversationStore((s) => s.submitToolInteraction);
+    const skipToolInteraction = useConversationStore((s) => s.skipToolInteraction);
+    const cancelToolInteraction = useConversationStore((s) => s.cancelToolInteraction);
+
+    const handleInteractionAction = useCallback(
+      async (
+        action:
+          | { type: 'submit'; payload: Record<string, unknown> }
+          | { type: 'skip'; payload?: Record<string, unknown>; reason?: string }
+          | { type: 'cancel'; payload?: Record<string, unknown> },
+      ) => {
+        switch (action.type) {
+          case 'submit': {
+            const { payload, options } = await prepareCustomInteractionSubmit(
+              identifier,
+              action.payload,
+              {
+                requestArgs: parsedArgs,
+                topicId,
+              },
+            );
+            await submitToolInteraction(id, payload, options);
+            break;
+          }
+          case 'skip': {
+            await recordCustomInteractionResolution(
+              identifier,
+              'skipped',
+              action.payload,
+              {
+                requestArgs: parsedArgs,
+                topicId,
+              },
+              action.reason,
+            );
+            await skipToolInteraction(id, action.reason);
+            break;
+          }
+          case 'cancel': {
+            await recordCustomInteractionResolution(identifier, 'cancelled', action.payload, {
+              requestArgs: parsedArgs,
+              topicId,
+            });
+            await cancelToolInteraction(id);
+            break;
+          }
+        }
+      },
+      [
+        cancelToolInteraction,
+        id,
+        identifier,
+        parsedArgs,
+        skipToolInteraction,
+        submitToolInteraction,
+        topicId,
+      ],
+    );
+
     const BuiltinToolInterventionRender = getBuiltinIntervention(identifier, apiName);
 
     if (BuiltinToolInterventionRender) {
@@ -98,6 +168,37 @@ const Intervention = memo<InterventionProps>(
           </Suspense>
         );
 
+      if (isCustomInteraction) {
+        return (
+          <Flexbox gap={12}>
+            <BuiltinToolInterventionRender
+              apiName={apiName}
+              args={parsedArgs}
+              identifier={identifier}
+              interactionMode="custom"
+              messageId={id}
+              registerBeforeApprove={registerBeforeApprove}
+              onArgsChange={handleArgsChange}
+              onInteractionAction={handleInteractionAction}
+            />
+          </Flexbox>
+        );
+      }
+
+      const actions = (
+        <Flexbox horizontal justify={'flex-end'}>
+          <ApprovalActions
+            apiName={apiName}
+            approvalMode={approvalMode}
+            assistantGroupId={assistantGroupId}
+            identifier={identifier}
+            messageId={id}
+            toolCallId={toolCallId}
+            onBeforeApprove={handleBeforeApprove}
+          />
+        </Flexbox>
+      );
+
       return (
         <Flexbox gap={12}>
           <SecurityBlacklistWarning args={parsedArgs} />
@@ -109,16 +210,7 @@ const Intervention = memo<InterventionProps>(
             registerBeforeApprove={registerBeforeApprove}
             onArgsChange={handleArgsChange}
           />
-          <Flexbox horizontal justify={'flex-end'}>
-            <ApprovalActions
-              apiName={apiName}
-              approvalMode={approvalMode}
-              identifier={identifier}
-              messageId={id}
-              toolCallId={toolCallId}
-              onBeforeApprove={handleBeforeApprove}
-            />
-          </Flexbox>
+          {actionsPortalTarget ? createPortal(actions, actionsPortalTarget) : actions}
         </Flexbox>
       );
     }
@@ -127,7 +219,9 @@ const Intervention = memo<InterventionProps>(
       <Flexbox gap={12}>
         <SecurityBlacklistWarning args={parsedArgs} />
         <Fallback
+          actionsPortalTarget={actionsPortalTarget}
           apiName={apiName}
+          assistantGroupId={assistantGroupId}
           id={id}
           identifier={identifier}
           requestArgs={requestArgs}
