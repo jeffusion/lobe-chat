@@ -1,6 +1,7 @@
 'use client';
 
 import { builtinTools } from '@lobechat/builtin-tools';
+import { DEFAULT_INBOX_AVATAR } from '@lobechat/const';
 import type { BuiltinToolManifest, LobeChatPluginApi } from '@lobechat/types';
 
 import type { ToolRenderFixture } from '../lifecycleMode';
@@ -9,13 +10,13 @@ import claudeCode from './claude-code';
 import codex from './codex';
 import github from './github';
 import lobeActivator from './lobe-activator';
+import lobeAgent from './lobe-agent';
 import lobeAgentBuilder from './lobe-agent-builder';
 import lobeAgentDocuments from './lobe-agent-documents';
 import lobeAgentManagement from './lobe-agent-management';
 import lobeCloudSandbox from './lobe-cloud-sandbox';
 import lobeGroupAgentBuilder from './lobe-group-agent-builder';
 import lobeGroupManagement from './lobe-group-management';
-import lobeGtd from './lobe-gtd';
 import lobeKnowledgeBase from './lobe-knowledge-base';
 import lobeLocalSystem from './lobe-local-system';
 import lobeNotebook from './lobe-notebook';
@@ -39,6 +40,19 @@ export interface ToolRenderMeta {
 }
 
 export const DEVTOOLS_GROUP_ID = 'devtools-preview-group';
+
+/**
+ * Identity for the seeded Aggregate-preview conversation. The fixture messages
+ * resolve their avatar/name through this agentId, so seeding `agentMap` with
+ * this meta makes the preview turn read as "Lobe AI" instead of the
+ * unresolved-agent fallback ("Unnamed Assistant").
+ */
+export const DEVTOOLS_AGENT_ID = 'devtools-render-gallery';
+
+export const DEVTOOLS_AGENT_META = {
+  avatar: DEFAULT_INBOX_AVATAR,
+  title: 'Lobe AI',
+};
 
 export const DEVTOOLS_GROUP_DETAIL = {
   agents: [
@@ -67,13 +81,13 @@ const toolsetModules: ToolsetFixtureModule[] = [
   codex,
   github,
   lobeActivator,
+  lobeAgent,
   lobeAgentBuilder,
   lobeAgentDocuments,
   lobeAgentManagement,
   lobeCloudSandbox,
   lobeGroupAgentBuilder,
   lobeGroupManagement,
-  lobeGtd,
   lobeKnowledgeBase,
   lobeLocalSystem,
   lobeNotebook,

@@ -37,7 +37,7 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
     height: 28px;
     padding-block: 0;
     padding-inline: 6px;
-    border: 1px solid ${cssVar.colorBorderSecondary};
+    border: 1px solid ${cssVar.colorFillTertiary};
     border-radius: 6px;
 
     font-size: 12px;
@@ -58,7 +58,7 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
     width: 28px !important;
     height: 28px !important;
     margin-block: 0 !important;
-    border: 1px solid ${cssVar.colorBorderSecondary};
+    border: 1px solid ${cssVar.colorFillTertiary};
     border-radius: 6px;
 
     box-shadow: none;
@@ -74,7 +74,7 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
     padding-inline: 12px 8px;
   `,
   itemDivider: css`
-    border-block-start: 1px solid ${cssVar.colorBorderSecondary};
+    border-block-start: 1px solid ${cssVar.colorFillTertiary};
   `,
   text: css`
     overflow: hidden;
@@ -105,6 +105,7 @@ const QueuedFilePreview = memo<QueuedFilePreviewProps>(({ file }) => {
         size={PREVIEW_SIZE}
         src={file.url}
         title={file.name}
+        variant={'borderless'}
         styles={{
           image: { height: PREVIEW_SIZE, width: PREVIEW_SIZE },
           wrapper: { height: PREVIEW_SIZE, width: PREVIEW_SIZE },

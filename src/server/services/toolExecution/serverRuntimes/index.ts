@@ -8,22 +8,24 @@
  */
 import type { ToolExecutionContext } from '../types';
 import { activatorRuntime } from './activator';
+import { agentBuilderRuntime } from './agentBuilder';
 import { agentDocumentsRuntime } from './agentDocuments';
 import { agentManagementRuntime } from './agentManagement';
-import { agentMarketplaceRuntime } from './agentMarketplace';
+import { agentSignalFeedbackIntentRuntime } from './agentSignalFeedbackIntent';
+import { agentSignalReflectionRuntime } from './agentSignalReflection';
+import { agentSignalReviewRuntime } from './agentSignalReview';
 import { briefRuntime } from './brief';
 import { calculatorRuntime } from './calculator';
 import { cloudSandboxRuntime } from './cloudSandbox';
 import { credsRuntime } from './creds';
-import { cronRuntime } from './cron';
-import { gtdRuntime } from './gtd';
+import { knowledgeBaseRuntime } from './knowledgeBase';
 import { lobeAgentRuntime } from './lobeAgent';
 import { localSystemRuntime } from './localSystem';
 import { memoryRuntime } from './memory';
 import { messageRuntime } from './message';
 import { notebookRuntime } from './notebook';
 import { remoteDeviceRuntime } from './remoteDevice';
-import { selfIterationIntentRuntime } from './selfIterationIntent';
+import { selfFeedbackIntentRuntime } from './selfFeedbackIntent';
 import { skillManagementRuntime } from './skillManagement';
 import { skillsRuntime } from './skills';
 import { skillStoreRuntime } from './skillStore';
@@ -50,6 +52,7 @@ const registerRuntimes = (runtimes: ServerRuntimeRegistration[]) => {
 
 // Register all server runtimes
 registerRuntimes([
+  agentBuilderRuntime,
   webBrowsingRuntime,
   cloudSandboxRuntime,
   calculatorRuntime,
@@ -69,12 +72,13 @@ registerRuntimes([
   topicReferenceRuntime,
   userInteractionRuntime,
   credsRuntime,
-  cronRuntime,
-  gtdRuntime,
+  knowledgeBaseRuntime,
   webOnboardingRuntime,
-  agentMarketplaceRuntime,
   lobeAgentRuntime,
-  selfIterationIntentRuntime,
+  selfFeedbackIntentRuntime,
+  agentSignalReviewRuntime,
+  agentSignalReflectionRuntime,
+  agentSignalFeedbackIntentRuntime,
 ]);
 
 // ==================== Registry API ====================

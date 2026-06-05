@@ -1,4 +1,5 @@
 import type { ISnapshotStore, StepSnapshot } from '@lobechat/agent-tracing';
+import type { ChatMessageErrorAttribution, ChatMessageErrorSeverity } from '@lobechat/types';
 import debug from 'debug';
 
 import type { StepCompletionReason, StepPresentationData } from './types';
@@ -15,6 +16,17 @@ export interface AppendStepParams {
    */
   agentState: any;
   beforeStepSignalEvents: SignalEvent[];
+  /**
+   * Context engine input/output captured for this step. Delivered via
+   * `RuntimeExecutorContext.tracingContextEngine` rather than through the
+   * `events` array, so CE payloads (agentDocuments, systemRole, …) stay out
+   * of the Redis state pipeline.
+   *
+   * Context: agent-runtime state blob was hitting Upstash Redis 10MB limit
+   * because ~97% of each step payload was tracing-only fields. Routing CE
+   * via tracingContextEngine keeps it in trace only, keeping Redis state lean.
+   */
+  contextEngine?: { input?: unknown; output?: unknown };
   currentContext?: { payload?: unknown; phase?: string; stepContext?: unknown };
   externalRetryCount: number;
   presentation: StepPresentationData;
@@ -35,12 +47,28 @@ export interface FinalizeParams {
    */
   appendEventsToLastStep?: SignalEvent[];
   completionReason: StepCompletionReason;
-  error?: { message: string; type: string };
+  /**
+   * Top-level error on the persisted snapshot. The classification fields
+   * (`attribution`, `category`, `severity`, …) mirror `ChatMessageError` and
+   * are sourced from `ERROR_CODE_SPECS` at the runtime catch site; unknown
+   * codes simply omit them.
+   */
+  error?: {
+    attribution?: ChatMessageErrorAttribution;
+    category?: string;
+    countAsFailure?: boolean;
+    httpStatus?: number;
+    message: string;
+    numericId?: number;
+    retryable?: boolean;
+    severity?: ChatMessageErrorSeverity;
+    type: string;
+  };
   /**
    * Synthetic step record for the error path. The real failing step never
    * reached `appendStep` because the executor threw before the partial push,
    * so the catch caller passes this to keep step counts aligned with the
-   * assistant message that triggered the call. See LOBE-8533.
+   * assistant message that triggered the call. See .
    */
   failedStep?: { startedAt: number; stepIndex: number };
   state: any;
@@ -74,7 +102,9 @@ export class OperationTraceRecorder {
       this.initPartialHeader(partial, params.agentState);
 
       if (!partial.steps) partial.steps = [];
-      partial.steps.push(this.buildStepSnapshot(params));
+      const newStep = this.buildStepSnapshot(params);
+      this.deduplicateCeSnapshot(newStep, partial.steps);
+      partial.steps.push(newStep);
 
       await this.store.savePartial(operationId, partial);
     } catch (e) {
@@ -108,15 +138,10 @@ export class OperationTraceRecorder {
         // existing record instead of pushing a duplicate stepIndex —
         // duplicates corrupt ordering and per-step metrics in trace
         // reconstruction.
-        const existing = partial.steps.find(
-          (s) => s.stepIndex === params.failedStep!.stepIndex,
-        );
+        const existing = partial.steps.find((s) => s.stepIndex === params.failedStep!.stepIndex);
         if (existing) {
           if (params.error) {
-            existing.events = [
-              ...(existing.events ?? []),
-              { error: params.error, type: 'error' },
-            ];
+            existing.events = [...(existing.events ?? []), { error: params.error, type: 'error' }];
           }
         } else {
           const now = Date.now();
@@ -174,6 +199,40 @@ export class OperationTraceRecorder {
     }
   }
 
+  /**
+   * Strip `contextEngine` input/output fields that are identical to the most-recently
+   * stored values in previous steps. The viewer reconstructs the full snapshot by
+   * walking back through the step list (same pattern as messagesBaseline + messagesDelta).
+   */
+  private deduplicateCeSnapshot(step: StepSnapshot, prevSteps: StepSnapshot[]): void {
+    if (!step.contextEngine) return;
+
+    let lastInputJson: string | undefined;
+    let lastOutputJson: string | undefined;
+
+    for (let i = prevSteps.length - 1; i >= 0; i--) {
+      const prev = prevSteps[i];
+      if (!prev.contextEngine) continue;
+      if (lastInputJson === undefined && prev.contextEngine.input !== undefined) {
+        lastInputJson = JSON.stringify(prev.contextEngine.input);
+      }
+      if (lastOutputJson === undefined && prev.contextEngine.output !== undefined) {
+        lastOutputJson = JSON.stringify(prev.contextEngine.output);
+      }
+      if (lastInputJson !== undefined && lastOutputJson !== undefined) break;
+    }
+
+    const storeInput =
+      lastInputJson === undefined || JSON.stringify(step.contextEngine.input) !== lastInputJson;
+    const storeOutput =
+      lastOutputJson === undefined || JSON.stringify(step.contextEngine.output) !== lastOutputJson;
+
+    step.contextEngine = {
+      ...(storeInput ? { input: step.contextEngine.input } : {}),
+      ...(storeOutput ? { output: step.contextEngine.output } : {}),
+    };
+  }
+
   private initPartialHeader(partial: any, agentState: any): void {
     if (partial.startedAt) return;
     partial.startedAt = Date.now();
@@ -189,6 +248,7 @@ export class OperationTraceRecorder {
       agentState,
       afterStepSignalEvents,
       beforeStepSignalEvents,
+      contextEngine: ceInput,
       currentContext,
       externalRetryCount,
       presentation,
@@ -206,11 +266,20 @@ export class OperationTraceRecorder {
     const isBaseline = stepIndex === 0 || isCompression;
     const messagesDelta = afterMessages.slice(prevMessages.length);
 
+    // CE data is structural state, not a streaming event — delivered via the
+    // typed `contextEngine` field on AppendStepParams (sourced from
+    // RuntimeExecutorContext.tracingContextEngine). Uses the same delta
+    // pattern as messagesBaseline/messagesDelta.
+    const contextEngine: StepSnapshot['contextEngine'] = ceInput
+      ? { input: ceInput.input, output: ceInput.output }
+      : undefined;
+
     // Strip heavy/redundant data from events before persisting to snapshot.
+    const rawEvents = (stepResult.events as any[]) ?? [];
     const snapshotEvents = [
       ...beforeStepSignalEvents,
-      ...((stepResult.events as any[])
-        ?.filter((e) => e.type !== 'llm_stream')
+      ...rawEvents
+        .filter((e) => e.type !== 'llm_stream')
         .map((e) => {
           if (e.type === 'done' && e.finalState) {
             // Remove reconstructible fields from finalState:
@@ -229,7 +298,7 @@ export class OperationTraceRecorder {
             return { ...e, finalState: restState };
           }
           return e;
-        }) ?? []),
+        }),
       ...afterStepSignalEvents,
     ];
 
@@ -254,6 +323,7 @@ export class OperationTraceRecorder {
 
     return {
       activatedStepToolsDelta,
+      contextEngine,
       completedAt: Date.now(),
       content: presentation.content,
       context: {

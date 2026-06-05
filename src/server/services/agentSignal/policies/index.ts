@@ -7,6 +7,8 @@ import type {
 } from './analyzeIntent/actions';
 import type { CreateFeedbackDomainJudgePolicyOptions } from './analyzeIntent/feedbackDomain';
 import type { CreateFeedbackSatisfactionJudgePolicyOptions } from './analyzeIntent/feedbackSatisfaction';
+import type { CreateCompletionPolicyOptions } from './completionPolicy';
+import { createCompletionPolicy } from './completionPolicy';
 import type { CreateReviewNightlyPolicyOptions } from './reviewNightly';
 import { createReviewNightlyPolicy } from './reviewNightly';
 
@@ -17,15 +19,18 @@ export * from './analyzeIntent/feedbackAction';
 export * from './analyzeIntent/feedbackDomain';
 export * from './analyzeIntent/feedbackDomainAgent';
 export * from './analyzeIntent/feedbackSatisfaction';
+export * from './completionPolicy';
 export * from './reviewNightly';
 export * from './types';
 
 export interface CreateDefaultAgentSignalPoliciesOptions extends CreateFeedbackDomainJudgePolicyOptions {
   classifierDiagnostics?: CreateAnalyzeIntentPolicyOptions['classifierDiagnostics'];
+  /** Optional callbacks invoked after agent.execution.completed for builtin self-iteration agents. */
+  completion?: CreateCompletionPolicyOptions;
   feedbackSatisfactionJudge?: CreateFeedbackSatisfactionJudgePolicyOptions;
   nightlyReview?: CreateReviewNightlyPolicyOptions['nightlyReview'];
   procedure?: CreateAnalyzeIntentPolicyOptions['procedure'];
-  selfIterationIntent?: CreateReviewNightlyPolicyOptions['selfIterationIntent'];
+  selfFeedbackIntent?: CreateReviewNightlyPolicyOptions['selfFeedbackIntent'];
   selfReflection?: CreateReviewNightlyPolicyOptions['selfReflection'];
   skillIntentClassifier?: CreateAnalyzeIntentPolicyOptions['skillIntentClassifier'];
   skillManagement?: SkillManagementActionHandlerOptions;
@@ -41,21 +46,22 @@ const DEFAULT_AGENT_SIGNAL_POLICY_FACTORIES: DefaultAgentSignalPolicyFactory[] =
   (options) =>
     createReviewNightlyPolicy({
       nightlyReview: options.nightlyReview,
-      selfIterationIntent: options.selfIterationIntent,
+      selfFeedbackIntent: options.selfFeedbackIntent,
       selfReflection: options.selfReflection,
     }),
+  (options) => [createCompletionPolicy(options.completion ?? {})],
 ];
 
 /**
- * Creates the default Agent Signal policy stack with optional maintenance source handlers.
+ * Creates the default Agent Signal policy stack with optional self-iteration source handlers.
  *
  * Use when:
  * - Runtime creation needs the standard analyze-intent policies
- * - Callers want to opt into nightly, self-reflection, or self-iteration maintenance handlers
+ * - Callers want to opt into nightly self-review, self-reflection, or self-feedback handlers
  *   with explicit handler options
  *
  * Expects:
- * - Optional maintenance options are complete bundles for their source handlers
+ * - Optional self-iteration options are complete bundles for their source handlers
  * - Missing optional options mean the corresponding source handler is not installed
  *
  * Returns:

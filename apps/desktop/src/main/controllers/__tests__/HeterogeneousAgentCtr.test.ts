@@ -1,13 +1,21 @@
 import { EventEmitter } from 'node:events';
 import { access, mkdtemp, readdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import * as os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 
 import { HeterogeneousAgentSessionErrorCode } from '@lobechat/electron-client-ipc';
+// `electron` is mocked below; this binding is the mock object so tests can
+// flip `isPackaged` to exercise the packaged-build tracing gate.
+import { app as electronAppMock } from 'electron';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import HeterogeneousAgentCtr from '../HeterogeneousAgentCtr';
+
+vi.mock('node:os', async () => {
+  const actual = await vi.importActual<typeof os>('node:os');
+  return { ...actual, platform: vi.fn(() => 'linux') };
+});
 
 const FAKE_DESKTOP_PATH = '/Users/fake/Desktop';
 
@@ -18,6 +26,7 @@ const { mockGetAllWindows } = vi.hoisted(() => ({
 vi.mock('electron', () => ({
   BrowserWindow: { getAllWindows: () => mockGetAllWindows() },
   app: {
+    getAppPath: vi.fn(() => '/fake/appPath'),
     getPath: vi.fn((name: string) => (name === 'desktop' ? FAKE_DESKTOP_PATH : `/fake/${name}`)),
     isPackaged: false,
     on: vi.fn(),
@@ -111,7 +120,7 @@ describe('HeterogeneousAgentCtr', () => {
   let appStoragePath: string;
 
   beforeEach(async () => {
-    appStoragePath = await mkdtemp(path.join(tmpdir(), 'lobehub-hetero-'));
+    appStoragePath = await mkdtemp(path.join(os.tmpdir(), 'lobehub-hetero-'));
   });
 
   afterEach(async () => {
@@ -326,13 +335,14 @@ describe('HeterogeneousAgentCtr', () => {
       sessionOverrides: Record<string, any> = {},
       stdoutLines: string[] = [],
       sendPromptOverrides: Partial<{ imageList: Array<{ id: string; url: string }> }> = {},
+      storeGet?: (key: string, defaultValue?: any) => any,
     ) => {
       const { proc, writes } = createFakeProc({ stdoutLines });
       nextFakeProc = proc;
 
       const ctr = new HeterogeneousAgentCtr({
         appStoragePath,
-        storeManager: { get: vi.fn() },
+        storeManager: { get: storeGet ? vi.fn(storeGet) : vi.fn() },
       } as any);
       const { sessionId } = await ctr.startSession({
         agentType: 'codex',
@@ -615,6 +625,85 @@ describe('HeterogeneousAgentCtr', () => {
       }
     });
 
+    it('centralizes to heteroAgent/tracing in dev too when the toggle is on', async () => {
+      const originalNodeEnv = process.env.NODE_ENV;
+      // Dev (isPackaged stays false), but the user opted in via the toggle.
+      process.env.NODE_ENV = 'development';
+
+      try {
+        const prompt = 'trace this opted-in dev run';
+        const rawLine = `${JSON.stringify({
+          thread_id: 'thread_codex_dev_optin',
+          type: 'thread.started',
+        })}\n`;
+        await runSendPrompt(prompt, { cwd: appStoragePath }, [rawLine], {}, (key: string) =>
+          key === 'heteroTracingEnabled' ? true : undefined,
+        );
+
+        const agentTraceRoot = path.join(appStoragePath, 'heteroAgent', 'tracing', 'codex');
+        const traceDirs = await readdir(agentTraceRoot);
+        expect(traceDirs).toHaveLength(1);
+
+        // Toggle wins over the dev cwd default.
+        await expect(readdir(path.join(appStoragePath, '.heerogeneous-tracing'))).rejects.toThrow();
+      } finally {
+        process.env.NODE_ENV = originalNodeEnv;
+      }
+    });
+
+    it('traces to the centralized heteroAgent/tracing dir in packaged builds when the toggle is on', async () => {
+      const originalNodeEnv = process.env.NODE_ENV;
+      // The gate short-circuits to `false` under NODE_ENV=test, so simulate a
+      // real packaged production process.
+      process.env.NODE_ENV = 'production';
+      (electronAppMock as any).isPackaged = true;
+
+      try {
+        const prompt = 'trace this packaged run';
+        const rawLine = `${JSON.stringify({
+          thread_id: 'thread_codex_packaged',
+          type: 'thread.started',
+        })}\n`;
+        await runSendPrompt(prompt, { cwd: appStoragePath }, [rawLine], {}, (key: string) =>
+          key === 'heteroTracingEnabled' ? true : undefined,
+        );
+
+        // Centralized under appStoragePath/heteroAgent/tracing — NOT in the cwd.
+        const traceRoot = path.join(appStoragePath, 'heteroAgent', 'tracing');
+        const agentTraceRoot = path.join(traceRoot, 'codex');
+        const traceDirs = await readdir(agentTraceRoot);
+        expect(traceDirs).toHaveLength(1);
+
+        const traceDir = path.join(agentTraceRoot, traceDirs[0]);
+        await expect(readFile(path.join(traceDir, 'stdout.jsonl'), 'utf8')).resolves.toBe(rawLine);
+
+        // The dev-style cwd location must NOT be written in packaged mode.
+        await expect(readdir(path.join(appStoragePath, '.heerogeneous-tracing'))).rejects.toThrow();
+      } finally {
+        process.env.NODE_ENV = originalNodeEnv;
+        (electronAppMock as any).isPackaged = false;
+      }
+    });
+
+    it('does not trace in packaged builds when the toggle is off', async () => {
+      const originalNodeEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = 'production';
+      (electronAppMock as any).isPackaged = true;
+
+      try {
+        await runSendPrompt('no trace please', { cwd: appStoragePath }, [], {}, (key: string) =>
+          key === 'heteroTracingEnabled' ? false : undefined,
+        );
+
+        await expect(
+          readdir(path.join(appStoragePath, 'heteroAgent', 'tracing')),
+        ).rejects.toThrow();
+      } finally {
+        process.env.NODE_ENV = originalNodeEnv;
+        (electronAppMock as any).isPackaged = false;
+      }
+    });
+
     it('skips trace creation (and never auto-creates the cwd) when the cwd is missing', async () => {
       const originalNodeEnv = process.env.NODE_ENV;
       process.env.NODE_ENV = 'development';
@@ -712,7 +801,7 @@ describe('HeterogeneousAgentCtr', () => {
    * `stdout.on('end')` handler can schedule `pipeline.flush()` onto the
    * broadcast queue), then drain the queue, then broadcast complete.
    */
-  describe('exit-before-end ordering (LOBE-8516 phase 0 race)', () => {
+  describe('exit-before-end ordering (phase 0 race)', () => {
     let broadcasts: Array<{ channel: string; data: any }>;
 
     beforeEach(() => {
@@ -800,6 +889,133 @@ describe('HeterogeneousAgentCtr', () => {
       // execution (emitted only by adapter.flush()) is in the broadcast.
       const toolEnds = events.filter((b) => (b.data as any)?.event?.type === 'tool_end');
       expect(toolEnds.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('app-quit cleanup of AskUserQuestion temp configs ()', () => {
+    // The async exit-handler cleanup races Electron's main-process teardown
+    // and used to leak `lobe-cc-mcp-<opId>.json` files in `os.tmpdir()` on
+    // every quit. The controller now unlinks pending intervention temp
+    // configs *synchronously* from `before-quit` AND from process signal
+    // handlers (SIGTERM / SIGINT — `before-quit` doesn't fire on external
+    // kills). These tests exercise both paths against real files.
+
+    /**
+     * Drop a temp `lobe-cc-mcp-<id>.json` and stash it on the controller's
+     * `opIdToIntervention` map under the same key, so the quit hook treats
+     * it like a real pending intervention and tries to unlink it.
+     */
+    const seedPendingIntervention = async (ctr: HeterogeneousAgentCtr, opId: string) => {
+      const tmpConfigPath = path.join(os.tmpdir(), `lobe-cc-mcp-test-${opId}.json`);
+      await writeFile(tmpConfigPath, '{"mcpServers":{}}');
+      const slot = {
+        bridge: {} as any,
+        pumpDone: Promise.resolve(),
+        tmpConfigPath,
+      };
+      (ctr as any).opIdToIntervention.set(opId, slot);
+      return tmpConfigPath;
+    };
+
+    const captureRegisteredHandler = (
+      registerSpy: ReturnType<typeof vi.fn> | ReturnType<typeof vi.spyOn>,
+      eventName: string,
+    ): (() => void) => {
+      const calls = (registerSpy as any).mock.calls as Array<[string, () => void]>;
+      const match = calls.findLast(([evt]) => evt === eventName);
+      if (!match) throw new Error(`no handler registered for "${eventName}"`);
+      return match[1];
+    };
+
+    it('before-quit synchronously unlinks every pending intervention temp config', async () => {
+      const electron = (await import('electron')) as any;
+      electron.app.on.mockClear();
+
+      const ctr = new HeterogeneousAgentCtr({
+        appStoragePath,
+        storeManager: { get: vi.fn() },
+      } as any);
+
+      const fileA = await seedPendingIntervention(ctr, 'opA');
+      const fileB = await seedPendingIntervention(ctr, 'opB');
+
+      ctr.afterAppReady();
+      const beforeQuit = captureRegisteredHandler(electron.app.on, 'before-quit');
+      beforeQuit();
+
+      await expect(access(fileA)).rejects.toThrow();
+      await expect(access(fileB)).rejects.toThrow();
+    });
+
+    it('SIGTERM handler unlinks pending intervention temp configs (external-kill path)', async () => {
+      // External kills (test harness, OS shutdown) skip Electron's lifecycle
+      // events entirely — `before-quit` never fires, so the controller has to
+      // hook the raw process signal too. Stub `process.on` so the handler is
+      // *recorded* but never actually attached to the test runner's process
+      // (otherwise the test leaks a SIGTERM listener that survives the test).
+      // Same for `process.exit` — the controller's fail-safe shouldn't get a
+      // chance to actually exit the worker if its `setTimeout(...).unref()`
+      // ever fires before mockRestore.
+      const electron = (await import('electron')) as any;
+      electron.app.on.mockClear();
+      const processOnSpy = vi.spyOn(process, 'on').mockImplementation(() => process);
+      const processExitSpy = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+
+      const ctr = new HeterogeneousAgentCtr({
+        appStoragePath,
+        storeManager: { get: vi.fn() },
+      } as any);
+      const file = await seedPendingIntervention(ctr, 'opSigterm');
+
+      ctr.afterAppReady();
+      const sigterm = captureRegisteredHandler(processOnSpy, 'SIGTERM');
+      sigterm();
+
+      await expect(access(file)).rejects.toThrow();
+
+      processOnSpy.mockRestore();
+      processExitSpy.mockRestore();
+    });
+
+    it('SIGINT handler unlinks pending intervention temp configs (Ctrl-C path)', async () => {
+      const electron = (await import('electron')) as any;
+      electron.app.on.mockClear();
+      const processOnSpy = vi.spyOn(process, 'on').mockImplementation(() => process);
+      const processExitSpy = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+
+      const ctr = new HeterogeneousAgentCtr({
+        appStoragePath,
+        storeManager: { get: vi.fn() },
+      } as any);
+      const file = await seedPendingIntervention(ctr, 'opSigint');
+
+      ctr.afterAppReady();
+      const sigint = captureRegisteredHandler(processOnSpy, 'SIGINT');
+      sigint();
+
+      await expect(access(file)).rejects.toThrow();
+
+      processOnSpy.mockRestore();
+      processExitSpy.mockRestore();
+    });
+
+    it('cleanup is idempotent — already-deleted files do not throw', async () => {
+      const electron = (await import('electron')) as any;
+      electron.app.on.mockClear();
+
+      const ctr = new HeterogeneousAgentCtr({
+        appStoragePath,
+        storeManager: { get: vi.fn() },
+      } as any);
+      const file = await seedPendingIntervention(ctr, 'opIdempotent');
+
+      // Pre-delete the file out from under the controller — simulates a
+      // partial cleanup race where the async exit handler beat us to it.
+      await unlink(file);
+
+      ctr.afterAppReady();
+      const beforeQuit = captureRegisteredHandler(electron.app.on, 'before-quit');
+      expect(() => beforeQuit()).not.toThrow();
     });
   });
 });

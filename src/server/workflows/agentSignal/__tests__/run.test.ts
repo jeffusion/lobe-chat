@@ -6,10 +6,9 @@ import { agents, messages, threads, topics, users } from '@lobechat/database/sch
 import { getTestDB } from '@lobechat/database/test-utils';
 import { describe, expect, it, vi } from 'vitest';
 
-import type { SelfReflectionReviewContext } from '@/server/services/agentSignal/policies/reviewNightly/selfReflection';
 import { createProcedurePolicyOptions as createProcedurePolicyOptionsFixture } from '@/server/services/agentSignal/procedure';
-import { MaintenanceReviewScope, ReviewRunStatus } from '@/server/services/agentSignal/services';
-import type { NightlyReviewContext } from '@/server/services/agentSignal/services/maintenance/nightlyCollector';
+import type { SelfReflectionReviewContext } from '@/server/services/agentSignal/services/selfIteration/reflection/handler';
+import type { NightlyReviewContext } from '@/server/services/agentSignal/services/selfIteration/review/collect';
 import type { AgentSignalPolicyStateStore } from '@/server/services/agentSignal/store/types';
 import type { RunAgentSignalWorkflowDeps } from '@/server/workflows/agentSignal/run';
 import { runAgentSignalWorkflow } from '@/server/workflows/agentSignal/run';
@@ -55,8 +54,15 @@ const createNightlyReviewContext = (input: {
     notSatisfied: [],
     satisfied: [],
   },
-  maintenanceSignals: [],
+  selfReviewSignals: [],
   managedSkills: [],
+  proposalActivity: {
+    active: [],
+    dismissedCount: 0,
+    expiredCount: 0,
+    staleCount: 0,
+    supersededCount: 0,
+  },
   receiptActivity: {
     appliedCount: 0,
     duplicateGroups: [],
@@ -68,6 +74,7 @@ const createNightlyReviewContext = (input: {
   relevantMemories: [],
   reviewWindowEnd: input.reviewWindowEnd,
   reviewWindowStart: input.reviewWindowStart,
+  selfFeedbackCandidates: [],
   toolActivity: [],
   topics: [],
   userId: input.userId,
@@ -812,21 +819,11 @@ describe('runAgentSignalWorkflow', () => {
           userId,
         }),
       ),
-      executePlan: vi.fn(async () => ({ actions: [], status: ReviewRunStatus.Completed })),
-      planReviewOutput: vi.fn(() => ({
-        actions: [],
-        plannerVersion: 'test',
-        reviewScope: MaintenanceReviewScope.Nightly,
-        summary: 'Noop',
-      })),
-      runMaintenanceReviewAgent: vi.fn(async () => ({
-        actions: [],
-        findings: [],
-        summary: 'Noop',
-      })),
+      db,
+      dispatch: vi.fn(async () => ({ operationId: 'op-self-iter-1', topicId: 'topic-1' })),
     };
-    const createNightlyReviewPolicyOptions: NonNullable<
-      RunAgentSignalWorkflowDeps['createNightlyReviewPolicyOptions']
+    const createSelfReviewPolicyOptions: NonNullable<
+      RunAgentSignalWorkflowDeps['createSelfReviewPolicyOptions']
     > = vi.fn(() => nightlyReviewPolicyOptions);
     const executeSourceEvent: NonNullable<RunAgentSignalWorkflowDeps['executeSourceEvent']> = vi.fn(
       async () => undefined,
@@ -848,12 +845,12 @@ describe('runAgentSignalWorkflow', () => {
     });
 
     await runAgentSignalWorkflow(createWorkflowContext({ agentId, sourceEvent, userId }), {
-      createNightlyReviewPolicyOptions,
+      createSelfReviewPolicyOptions,
       executeSourceEvent,
       getDb: async () => db,
     });
 
-    expect(createNightlyReviewPolicyOptions).toHaveBeenCalledWith({
+    expect(createSelfReviewPolicyOptions).toHaveBeenCalledWith({
       agentId,
       db,
       selfIterationEnabled: true,
@@ -890,19 +887,8 @@ describe('runAgentSignalWorkflow', () => {
       acquireReviewGuard: vi.fn(async () => true),
       canRunReview: vi.fn(async () => true),
       collectContext: vi.fn(async () => selfReflectionContext),
-      executePlan: vi.fn(async () => ({ actions: [], status: ReviewRunStatus.Completed })),
-      planReviewOutput: vi.fn(() => ({
-        actions: [],
-        plannerVersion: 'test',
-        reviewScope: MaintenanceReviewScope.SelfReflection,
-        summary: 'Noop',
-      })),
-      runMaintenanceReviewAgent: vi.fn(async () => ({
-        actions: [],
-        findings: [],
-        summary: 'Noop',
-      })),
-      writeReceipt: vi.fn(async () => {}),
+      db,
+      dispatch: vi.fn(async () => ({ operationId: 'op-self-iter-1', topicId: 'topic-1' })),
     };
     const createSelfReflectionPolicyOptions: NonNullable<
       RunAgentSignalWorkflowDeps['createSelfReflectionPolicyOptions']
@@ -953,26 +939,21 @@ describe('runAgentSignalWorkflow', () => {
     );
   });
 
-  it('installs self-iteration intent policy dependencies for declared intent sources', async () => {
+  it('installs self-feedback intent policy dependencies for declared intent sources', async () => {
     const db = await getTestDB();
     const userId = `eval_${uuid()}`;
     const agentId = `agent_${uuid()}`;
-    const sourceId = `self-iteration-intent:${userId}:${agentId}:topic:topic-1:tool-call-1`;
-    const selfIterationIntentPolicyOptions = {
+    const sourceId = `self-feedback-intent:${userId}:${agentId}:topic:topic-1:tool-call-1`;
+    const selfFeedbackIntentPolicyOptions = {
       acquireReviewGuard: vi.fn(async () => true),
       canRunReview: vi.fn(async () => true),
-      executePlan: vi.fn(async () => ({ actions: [], status: ReviewRunStatus.Completed })),
-      planReviewOutput: vi.fn(() => ({
-        actions: [],
-        plannerVersion: 'test',
-        reviewScope: MaintenanceReviewScope.SelfIterationIntent,
-        summary: 'Noop',
-      })),
-      writeReceipt: vi.fn(async () => {}),
+      db,
+      dispatch: vi.fn(async () => ({ operationId: 'op-self-iter-1', topicId: 'topic-1' })),
+      enrichEvidence: vi.fn(async () => ({ evidenceRefs: [] })),
     };
-    const createSelfIterationIntentPolicyOptions: NonNullable<
-      RunAgentSignalWorkflowDeps['createSelfIterationIntentPolicyOptions']
-    > = vi.fn(() => selfIterationIntentPolicyOptions);
+    const createSelfFeedbackIntentPolicyOptions: NonNullable<
+      RunAgentSignalWorkflowDeps['createSelfFeedbackIntentPolicyOptions']
+    > = vi.fn(() => selfFeedbackIntentPolicyOptions);
     const executeSourceEvent: NonNullable<RunAgentSignalWorkflowDeps['executeSourceEvent']> = vi.fn(
       async () => undefined,
     );
@@ -992,17 +973,17 @@ describe('runAgentSignalWorkflow', () => {
       },
       scopeKey: 'topic:topic-1',
       sourceId,
-      sourceType: AGENT_SIGNAL_SOURCE_TYPES.agentSelfIterationIntentDeclared,
+      sourceType: AGENT_SIGNAL_SOURCE_TYPES.agentSelfFeedbackIntentDeclared,
       timestamp: Date.now(),
     });
 
     await runAgentSignalWorkflow(createWorkflowContext({ agentId, sourceEvent, userId }), {
-      createSelfIterationIntentPolicyOptions,
+      createSelfFeedbackIntentPolicyOptions,
       executeSourceEvent,
       getDb: async () => db,
     });
 
-    expect(createSelfIterationIntentPolicyOptions).toHaveBeenCalledWith({
+    expect(createSelfFeedbackIntentPolicyOptions).toHaveBeenCalledWith({
       agentId,
       db,
       selfIterationEnabled: true,
@@ -1013,7 +994,7 @@ describe('runAgentSignalWorkflow', () => {
       expect.any(Object),
       expect.objectContaining({
         policyOptions: expect.objectContaining({
-          selfIterationIntent: selfIterationIntentPolicyOptions,
+          selfFeedbackIntent: selfFeedbackIntentPolicyOptions,
           skillManagement: {
             selfIterationEnabled: true,
           },

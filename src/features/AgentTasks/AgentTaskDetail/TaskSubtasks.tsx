@@ -1,6 +1,7 @@
 import type { TaskDetailSubtask } from '@lobechat/types';
 import { ActionIcon, Block, Flexbox, Icon, showContextMenu, Text } from '@lobehub/ui';
-import { App, Button, ConfigProvider, Tree } from 'antd';
+import { confirmModal } from '@lobehub/ui/base-ui';
+import { App, ConfigProvider, Tree } from 'antd';
 import type { DataNode } from 'antd/es/tree';
 import { cssVar } from 'antd-style';
 import { ChevronDown, ListTodoIcon, PlayCircle, Plus } from 'lucide-react';
@@ -23,6 +24,7 @@ import TaskTriggerTag from '../features/TaskTriggerTag';
 import { useTaskContextMenuActions } from '../features/useTaskItemContextMenu';
 import AccordionArrowIcon from '../shared/AccordionArrowIcon';
 import { styles } from '../shared/style';
+import { taskDetailPath } from '../shared/taskDetailPath';
 import RunSubtasksPreview from './RunSubtasksPreview';
 
 type TaskStatus = 'backlog' | 'canceled' | 'completed' | 'failed' | 'paused' | 'running';
@@ -126,7 +128,7 @@ const toTreeData = (tree: TaskTreeNode[]): DataNode[] => {
 
 const TaskSubtasks = memo(() => {
   const { t } = useTranslation('chat');
-  const { message, modal } = App.useApp();
+  const { message } = App.useApp();
   const navigate = useNavigate();
   const agentId = useTaskStore(taskDetailSelectors.activeTaskAgentId);
   const subtasks = useTaskStore(taskDetailSelectors.activeTaskSubtasks);
@@ -138,13 +140,6 @@ const TaskSubtasks = memo(() => {
   const [isCreating, setIsCreating] = useState(false);
   const [isExpanded, setIsExpanded] = useState(true);
   const [isPlanning, setIsPlanning] = useState(false);
-
-  const handleNavigate = useCallback(
-    (identifier: string) => {
-      navigate(`/task/${identifier}`);
-    },
-    [navigate],
-  );
 
   const subtaskMap = useMemo(() => {
     const map = new Map<string, TaskDetailSubtask>();
@@ -158,6 +153,14 @@ const TaskSubtasks = memo(() => {
     return map;
   }, [subtasks]);
 
+  const handleNavigate = useCallback(
+    (identifier: string) => {
+      const subtask = subtaskMap.get(identifier);
+      navigate(taskDetailPath(identifier, subtask?.assignee?.id ?? undefined));
+    },
+    [navigate, subtaskMap],
+  );
+
   const treeData = useMemo(() => {
     if (subtasks.length === 0) return [];
     return toTreeData(buildTree(subtasks));
@@ -170,12 +173,14 @@ const TaskSubtasks = memo(() => {
       event.preventDefault();
       showContextMenu(
         buildItems({
+          assigneeAgentId: subtask.assignee?.id,
           identifier: subtask.identifier,
           priority: subtask.priority,
           status: subtask.status,
         }),
       );
       installKeyboardHandlers({
+        assigneeAgentId: subtask.assignee?.id,
         identifier: subtask.identifier,
         priority: subtask.priority,
         status: subtask.status,
@@ -206,9 +211,8 @@ const TaskSubtasks = memo(() => {
       }
 
       const canRun = plan.totalRunnable > 0;
-      modal.confirm({
+      confirmModal({
         cancelText: t('taskDetail.runAll.cancel'),
-        centered: true,
         content: <RunSubtasksPreview plan={plan} />,
         okButtonProps: canRun ? undefined : { disabled: true },
         okText: t('taskDetail.runAll.confirm', { count: plan.totalRunnable }),
@@ -230,7 +234,6 @@ const TaskSubtasks = memo(() => {
           }
         },
         title: t('taskDetail.runAll.title'),
-        width: 520,
       });
     } catch (error) {
       console.error('[TaskSubtasks] Failed to plan subtasks:', error);
@@ -238,7 +241,7 @@ const TaskSubtasks = memo(() => {
     } finally {
       setIsPlanning(false);
     }
-  }, [taskId, isPlanning, message, modal, t, runReadySubtasks]);
+  }, [taskId, isPlanning, message, t, runReadySubtasks]);
 
   if (!taskId) return null;
 
@@ -326,18 +329,22 @@ const TaskSubtasks = memo(() => {
         </>
       ) : (
         <>
-          <Flexbox horizontal align="flex-start">
-            <Button
-              className={styles.addSubtaskButton}
-              icon={<Icon icon={Plus} size={14} />}
-              shape="round"
-              size="small"
-              type="text"
-              onClick={toggleCreating}
-            >
+          <Block
+            clickable
+            horizontal
+            align="center"
+            gap={8}
+            paddingBlock={4}
+            paddingInline={8}
+            style={{ width: 'fit-content' }}
+            variant="borderless"
+            onClick={toggleCreating}
+          >
+            <Icon color={cssVar.colorTextDescription} icon={Plus} size={16} />
+            <Text color={cssVar.colorTextSecondary} fontSize={13} weight={500}>
               {t('taskDetail.addSubtask')}
-            </Button>
-          </Flexbox>
+            </Text>
+          </Block>
           {isCreating && (
             <CreateTaskInlineEntry
               autoFocus

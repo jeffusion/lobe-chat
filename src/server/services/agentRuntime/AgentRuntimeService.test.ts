@@ -15,6 +15,12 @@ import {
 
 vi.mock('@lobechat/model-runtime', () => ({
   getModelPropertyWithFallback: vi.fn(),
+  // `llmErrorClassification.ts` reads these at module-load time; an empty
+  // spec map is fine here because this suite never exercises the runtime
+  // retry classifier path.
+  ERROR_CODE_SPECS: {},
+  getErrorCodeSpec: () => undefined,
+  refineErrorCode: () => undefined,
 }));
 
 // Mock trusted client to avoid server-side env access
@@ -636,22 +642,20 @@ describe('AgentRuntimeService', () => {
 
       const mockRuntime = { step: vi.fn().mockResolvedValue(mockStepResult) };
       vi.spyOn(service as any, 'createAgentRuntime').mockReturnValue({ runtime: mockRuntime });
-      vi.spyOn(service as any, 'handleHumanIntervention').mockResolvedValue({
+      const processSpy = vi.spyOn((service as any).humanIntervention, 'process').mockResolvedValue({
         newState: mockState,
         nextContext: mockParams.context,
       });
 
       const result = await service.executeStep(paramsWithIntervention);
 
-      expect((service as any).handleHumanIntervention).toHaveBeenCalledWith(
-        mockRuntime,
-        mockState,
-        {
-          humanInput: paramsWithIntervention.humanInput,
-          approvedToolCall: paramsWithIntervention.approvedToolCall,
-          rejectionReason: paramsWithIntervention.rejectionReason,
-        },
-      );
+      expect(processSpy).toHaveBeenCalledWith(mockState, {
+        approvedToolCall: paramsWithIntervention.approvedToolCall,
+        humanInput: paramsWithIntervention.humanInput,
+        rejectAndContinue: undefined,
+        rejectionReason: paramsWithIntervention.rejectionReason,
+        toolMessageId: undefined,
+      });
 
       expect(result.success).toBe(true);
       expect(result.nextStepScheduled).toBe(false); // Should not schedule next step when status is 'done'
@@ -1478,6 +1482,57 @@ describe('AgentRuntimeService', () => {
 
       expect(result).toBe(false);
       expect(mockCoordinator.saveAgentState).not.toHaveBeenCalled();
+    });
+  });
+
+  // Stream events at step / operation boundaries should carry the canonical
+  // UIChatMessage[] snapshot so the client can use the pushed payload as
+  // Source of Truth instead of refetching from DB.
+  describe('queryUiMessages', () => {
+    const stubMessageService = (svc: any, queryMessages: ReturnType<typeof vi.fn>) => {
+      svc.messageServiceInstance = { queryMessages };
+    };
+
+    it('returns messageService.queryMessages result when agentId + topicId are present', async () => {
+      const stubMessages = [{ id: 'msg_x', role: 'user' }];
+      const queryMessages = vi.fn().mockResolvedValue(stubMessages);
+      stubMessageService(service, queryMessages);
+
+      const result = await service.queryUiMessages({
+        metadata: { agentId: 'agt_1', topicId: 'tpc_1' },
+      } as any);
+
+      expect(queryMessages).toHaveBeenCalledWith({ agentId: 'agt_1', topicId: 'tpc_1' });
+      expect(result).toEqual(stubMessages);
+    });
+
+    it('returns undefined when agentId or topicId is missing (skips empty-array push)', async () => {
+      const queryMessages = vi.fn();
+      stubMessageService(service, queryMessages);
+
+      const noAgent = await service.queryUiMessages({
+        metadata: { topicId: 'tpc_1' },
+      } as any);
+      const noTopic = await service.queryUiMessages({
+        metadata: { agentId: 'agt_1' },
+      } as any);
+      const noMeta = await service.queryUiMessages({} as any);
+
+      expect(noAgent).toBeUndefined();
+      expect(noTopic).toBeUndefined();
+      expect(noMeta).toBeUndefined();
+      expect(queryMessages).not.toHaveBeenCalled();
+    });
+
+    it('returns undefined and never throws when DB query fails (stream events must not fail the step)', async () => {
+      const queryMessages = vi.fn().mockRejectedValue(new Error('db down'));
+      stubMessageService(service, queryMessages);
+
+      const result = await service.queryUiMessages({
+        metadata: { agentId: 'agt_1', topicId: 'tpc_1' },
+      } as any);
+
+      expect(result).toBeUndefined();
     });
   });
 });

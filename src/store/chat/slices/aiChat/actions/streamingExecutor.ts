@@ -15,6 +15,8 @@ import { type ToolsEngine } from '@lobechat/context-engine';
 import { buildTaskDetailPrompt, buildTaskListPrompt } from '@lobechat/prompts';
 import {
   type ConversationContext,
+  type MessageMetadata,
+  type RunSubAgentResult,
   type RuntimeInitialContext,
   type UIChatMessage,
 } from '@lobechat/types';
@@ -22,6 +24,7 @@ import debug from 'debug';
 import { t } from 'i18next';
 
 import { createAgentToolsEngine } from '@/helpers/toolEngineering';
+import { aiAgentService } from '@/services/aiAgent';
 import { isCanUseVideo, isCanUseVision } from '@/services/chat/helper';
 import { type ResolvedAgentConfig } from '@/services/chat/mecha';
 import { composeEnabledTools, resolveAgentConfig } from '@/services/chat/mecha';
@@ -169,7 +172,7 @@ export class StreamingExecutorActionImpl {
     initialContext,
     operationId,
     subAgentId: paramSubAgentId,
-    isSubTask,
+    isSubAgent,
   }: {
     messages: UIChatMessage[];
     parentMessageId: string;
@@ -186,7 +189,7 @@ export class StreamingExecutorActionImpl {
      * - scope: 'sub_agent': Used for agent config but doesn't change message ownership
      */
     subAgentId?: string;
-    isSubTask?: boolean;
+    isSubAgent?: boolean;
   }): {
     state: AgentState;
     context: AgentRuntimeContext;
@@ -211,13 +214,13 @@ export class StreamingExecutorActionImpl {
 
     // Resolve agent config with builtin agent runtime config merged
     // This ensures runtime plugins (e.g., 'lobe-agent-builder' for Agent Builder) are included
-    // - isSubTask: filters out lobe-gtd tools to prevent nested sub-task creation
+    // - isSubAgent: filters out lobe-agent tool to prevent nested sub-agent creation
     // - disableTools: clears all plugins for broadcast scenarios
     const agentConfig = resolveAgentConfig({
       agentId: effectiveAgentId || '',
       disableTools, // Clear plugins for broadcast scenarios
       groupId, // Pass groupId for supervisor detection
-      isSubTask, // Filter out lobe-gtd in sub-task context
+      isSubAgent, // Filter out lobe-agent in sub-agent context
       scope, // Pass scope from operation context
     });
 
@@ -258,9 +261,9 @@ export class StreamingExecutorActionImpl {
         : effectivePluginIds;
 
     log(
-      '[internal_createAgentState] resolved plugins=%o, isSubTask=%s, disableTools=%s, hasTopicReference=%s',
+      '[internal_createAgentState] resolved plugins=%o, isSubAgent=%s, disableTools=%s, hasTopicReference=%s',
       effectivePluginIds,
-      isSubTask,
+      isSubAgent,
       disableTools,
       hasTopicReference,
     );
@@ -473,21 +476,22 @@ export class StreamingExecutorActionImpl {
     initialContext?: AgentRuntimeContext;
     initialState?: AgentState;
     inPortalThread?: boolean;
+    metadata?: Pick<MessageMetadata, 'trigger'>;
     messages: UIChatMessage[];
     operationId?: string;
     parentMessageId: string;
     parentMessageType: 'user' | 'assistant' | 'tool';
     parentOperationId?: string;
     skipCreateFirstMessage?: boolean;
-    isSubTask?: boolean;
-  }): Promise<{ cost?: Cost; usage?: Usage } | void> => {
+    isSubAgent?: boolean;
+  }): Promise<{ cost?: Cost; model?: string; provider?: string; usage?: Usage } | void> => {
     const {
       disableTools,
       messages: originalMessages,
       parentMessageId,
       parentMessageType,
       context,
-      isSubTask,
+      isSubAgent,
     } = params;
 
     // Extract values from context
@@ -543,6 +547,7 @@ export class StreamingExecutorActionImpl {
         parentMessageType,
         threadId: threadId ?? undefined,
         topicId: topicId ?? undefined,
+        ...(parentMessageType === 'user' ? { triggerMessageId: parentMessageId } : {}),
       },
       sourceId: `${operationId}:client:start`,
       sourceType: 'client.runtime.start',
@@ -554,7 +559,7 @@ export class StreamingExecutorActionImpl {
     // ===========================================
     // Step 1: Create Agent State (resolves config once)
     // ===========================================
-    // agentConfig contains isSubTask filtering and is passed to callLLM executor
+    // agentConfig already has isSubAgent filtering applied and is passed to callLLM executor
     const {
       state: initialAgentState,
       context: initialAgentContext,
@@ -571,7 +576,7 @@ export class StreamingExecutorActionImpl {
       initialContext: params.initialContext,
       operationId,
       subAgentId, // Pass subAgentId for agent config retrieval (behavior depends on scope)
-      isSubTask, // Pass isSubTask to filter out lobe-gtd tools in sub-task context
+      isSubAgent, // Pass isSubAgent to filter out lobe-agent tool in sub-agent context
     });
 
     // Use model/provider from resolved agentConfig
@@ -610,6 +615,7 @@ export class StreamingExecutorActionImpl {
       executors: createAgentExecutors({
         agentConfig, // Pass pre-resolved config to callLLM executor
         get: this.#get,
+        metadata: params.metadata,
         messageKey,
         operationId,
         parentId: params.parentMessageId,
@@ -649,11 +655,13 @@ export class StreamingExecutorActionImpl {
       void emitClientAgentSignalSourceEvent({
         payload: {
           agentId,
+          ...(assistantMessageId ? { anchorMessageId: assistantMessageId } : {}),
           assistantMessageId,
           operationId,
           status: normalizeClientRuntimeCompleteStatus(state.status, operationStatus),
           threadId: threadId ?? undefined,
           topicId: topicId ?? undefined,
+          ...(parentMessageType === 'user' ? { triggerMessageId: parentMessageId } : {}),
         },
         sourceId: `${operationId}:client:complete`,
         sourceType: 'client.runtime.complete',
@@ -742,7 +750,7 @@ export class StreamingExecutorActionImpl {
       // REMEMBER: There is no test for it (too hard to add), if you want to change it , ask @arvinxx first
       if (
         result.nextContext?.phase &&
-        ['tasks_batch_result', 'tools_batch_result'].includes(result.nextContext?.phase)
+        ['sub_agents_batch_result', 'tools_batch_result'].includes(result.nextContext?.phase)
       ) {
         log(
           `[executeClientAgent] ${result.nextContext?.phase} completed, refreshing messages to sync state`,
@@ -971,7 +979,137 @@ export class StreamingExecutorActionImpl {
     }
 
     // Return usage and cost data for caller to use
-    return { cost: state.cost, usage: state.usage };
+    return { cost: state.cost, model, provider: provider ?? undefined, usage: state.usage };
+  };
+
+  /**
+   * Run a sub-agent inside an isolated thread using the *current* client
+   * runtime, then resolve with its final output so the calling tool can return
+   * a normal tool result. This is the client-side implementation behind
+   * `BuiltinToolContext.subAgent.run` — a sub-agent run is just a regular
+   * `executeClientAgent` invocation scoped to a fresh Thread, with
+   * `isSubAgent` set so the sub-agent can't recursively spawn more sub-agents.
+   */
+  runClientSubAgent = async (params: {
+    agentId: string;
+    description: string;
+    inheritMessages?: boolean;
+    instruction: string;
+    parentOperationId?: string;
+    toolMessageId: string;
+    topicId: string;
+  }): Promise<RunSubAgentResult> => {
+    const {
+      agentId,
+      topicId,
+      instruction,
+      description,
+      inheritMessages,
+      toolMessageId,
+      parentOperationId,
+    } = params;
+
+    const logId = `runClientSubAgent:${toolMessageId}`;
+
+    try {
+      // 1. Create the isolation Thread (persists thread + initial user message)
+      const threadResult = await aiAgentService.createClientTaskThread({
+        agentId,
+        instruction,
+        parentMessageId: toolMessageId,
+        title: description,
+        topicId,
+      });
+
+      if (!threadResult.success) {
+        log('[%s] Failed to create client task thread', logId);
+        return {
+          error: 'Failed to create sub-agent thread',
+          result: 'Failed to create sub-agent thread',
+          success: false,
+          threadId: '',
+        };
+      }
+
+      const { threadId, userMessageId, threadMessages } = threadResult;
+      log('[%s] Created thread %s, userMessage %s', logId, threadId, userMessageId);
+
+      // Register the freshly-created isolation thread in the client thread list
+      // so the tool Render can locate it (the "View Detail" button) and it shows
+      // in the sidebar without waiting for a topic switch to re-fetch threads.
+      void this.#get().refreshThreads();
+
+      // 2. Build the sub-agent ConversationContext (threadId provides isolation)
+      const subContext: ConversationContext = { agentId, scope: 'thread', threadId, topicId };
+
+      // 3. Create a child operation chained to the parent runtime operation
+      const { operationId: taskOperationId } = this.#get().startOperation({
+        context: subContext,
+        metadata: { executionMode: 'client', startTime: Date.now(), taskDescription: description },
+        parentOperationId,
+        type: 'execClientSubAgent',
+      });
+
+      // 4. Seed the thread message map so the persisted user message renders
+      this.#get().replaceMessages(threadMessages, { context: subContext });
+
+      // 5. Optionally inherit the parent conversation messages
+      let subMessages = [...threadMessages];
+      if (inheritMessages) {
+        const parentMessages = (
+          this.#get().dbMessagesMap[messageMapKey({ agentId, topicId })] || []
+        ).filter((m) => m.role !== 'task');
+        subMessages = [...parentMessages, ...subMessages];
+        this.#get().replaceMessages(subMessages, { context: subContext });
+      }
+
+      // 6. Run the sub-agent with the current client runtime
+      const runtimeResult = await this.#get().executeClientAgent({
+        context: subContext,
+        isSubAgent: true,
+        messages: subMessages,
+        operationId: taskOperationId,
+        parentMessageId: userMessageId,
+        parentMessageType: 'user',
+        parentOperationId,
+      });
+
+      // 7. Extract the sub-agent's final assistant output as the tool result
+      const subMessageKey = messageMapKey(subContext);
+      const subTaskMessages = this.#get().dbMessagesMap[subMessageKey] || [];
+      const lastAssistant = subTaskMessages.findLast((m) => m.role === 'assistant');
+      const resultContent = lastAssistant?.content || 'Task completed';
+      const totalToolCalls = subTaskMessages.filter((m) => m.role === 'tool').length;
+      const { usage, cost, model } = runtimeResult || {};
+      const totalTokens = usage?.llm?.tokens?.total;
+
+      // 8. Persist final Thread status + metadata
+      await aiAgentService.updateClientTaskThreadStatus({
+        completionReason: 'done',
+        metadata: {
+          totalCost: cost?.total,
+          totalMessages: subTaskMessages.length,
+          totalTokens,
+          totalToolCalls,
+        },
+        resultContent,
+        threadId,
+      });
+
+      this.#get().completeOperation(taskOperationId);
+
+      log('[%s] Completed, result %d chars', logId, resultContent.length);
+      return { model, result: resultContent, success: true, threadId, totalToolCalls, totalTokens };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      log('[%s] Error: %O', logId, error);
+      return {
+        error: errorMessage,
+        result: `Sub-agent execution failed: ${errorMessage}`,
+        success: false,
+        threadId: '',
+      };
+    }
   };
 }
 

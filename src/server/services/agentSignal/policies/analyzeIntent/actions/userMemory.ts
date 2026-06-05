@@ -1,16 +1,21 @@
-import type { AgentRuntimeContext, AgentState } from '@lobechat/agent-runtime';
+import type { AgentRuntimeContext } from '@lobechat/agent-runtime';
 import type {
   AgenticAttempt,
   BaseAction,
   ExecutorResult,
   SignalAttempt,
 } from '@lobechat/agent-signal';
-import { MemoryApiName, MemoryIdentifier } from '@lobechat/builtin-tool-memory';
+import { MemoryIdentifier } from '@lobechat/builtin-tool-memory';
 import type { LobeToolManifest, ToolExecutor, ToolSource } from '@lobechat/context-engine';
-import { RequestTrigger } from '@lobechat/types';
+import {
+  createAgentSignalMemoryWriterPrompt,
+  createAgentSignalMemoryWriterSystemRole,
+} from '@lobechat/prompts';
+import { RequestTrigger, ThreadType } from '@lobechat/types';
 import { nanoid } from '@lobechat/utils';
 
 import { PluginModel } from '@/database/models/plugin';
+import { ThreadModel } from '@/database/models/thread';
 import type { LobeChatDatabase } from '@/database/type';
 import {
   InMemoryAgentStateManager,
@@ -22,13 +27,14 @@ import {
   type ServerAgentToolsContext,
 } from '@/server/modules/Mecha';
 import { AgentService } from '@/server/services/agent';
+import type { AgentSignalOperationMarker } from '@/server/services/agentSignal/operationMarker';
 
 import type { RuntimeProcessorContext } from '../../../runtime/context';
 import { defineActionHandler } from '../../../runtime/middleware';
 import {
-  createMemoryMaintenanceService,
-  MemoryMaintenanceActionError,
-} from '../../../services/maintenance/memory';
+  createMemoryService,
+  MemoryActionError,
+} from '../../../services/selfIteration/tools/shared';
 import { hasAppliedActionIdempotency, markAppliedActionIdempotency } from '../../actionIdempotency';
 import type {
   ActionUserMemoryHandle,
@@ -37,46 +43,19 @@ import type {
   AgentSignalFeedbackSourceHints,
 } from '../../types';
 import { AGENT_SIGNAL_POLICY_ACTION_TYPES } from '../../types';
+import {
+  type MemoryActionTarget,
+  type MemoryAgentActionResult,
+  resolveMemoryActionResultFromState,
+  resolveMemoryActionTargetFromState,
+} from './memoryActionResult';
 
 const MEMORY_AGENT_MAX_STEPS = 8;
 
-const MEMORY_WRITE_TOOL_NAMES = new Set(
-  [
-    MemoryApiName.addActivityMemory,
-    MemoryApiName.addContextMemory,
-    MemoryApiName.addExperienceMemory,
-    MemoryApiName.addIdentityMemory,
-    MemoryApiName.addPreferenceMemory,
-    MemoryApiName.removeIdentityMemory,
-    MemoryApiName.updateIdentityMemory,
-  ].map((apiName) => `${MemoryIdentifier}/${apiName}`),
-);
-
-const MEMORY_WRITER_SYSTEM_ROLE = `You are the Agent Signal memory writer.
-
-You are not chatting with the user.
-Your job is to decide whether the feedback should update durable user memory.
-
-Use only the lobe-user-memory built-in tool when a durable memory write is justified.
-Choose the correct memory API based on the feedback:
-- addPreferenceMemory for stable future-facing preferences
-- addIdentityMemory / updateIdentityMemory / removeIdentityMemory for enduring identity facts or corrections
-- addContextMemory for ongoing situations, environments, or projects
-- addExperienceMemory for reusable lessons from outcomes or workflows
-- addActivityMemory for notable concrete events worth remembering
-
-Do not use memory tools for requests to create, update, refine, merge, consolidate, or store reusable skills, procedures, workflows, playbooks, checklists, agent capabilities, agent prompts, or agent documents.
-If the feedback asks for a "reusable skill", "future workflow", "PR review checklist skill", "agent capability", or similar operational artifact, skip memory and leave it to the skill/document management path.
-Apply the same boundary to Chinese feedback such as "复用 skill", "可复用流程", "review 流程", "检查清单", "下次参考这个流程", "保留这个流程", or "合并/更新清单".
-Do not summarize skill-management requests as preferences.
-
-If the feedback should not become durable memory, do not call any tools and end briefly.
-Do not invent your own JSON schema. Use the built-in tool exactly as exposed.`;
-
-export interface MemoryAgentActionResult {
-  detail?: string;
-  status: 'applied' | 'failed' | 'skipped';
-}
+// Backward-compatible re-export: the memory finalState helpers + result types
+// now live in the dependency-light ./memoryActionResult module.
+export type { MemoryActionTarget, MemoryAgentActionResult };
+export { resolveMemoryActionResultFromState, resolveMemoryActionTargetFromState };
 
 export interface UserMemoryActionHandlerOptions {
   agentService?: Pick<AgentService, 'getAgentConfig'>;
@@ -86,10 +65,12 @@ export interface UserMemoryActionHandlerOptions {
     conflictPolicy?: AgentSignalFeedbackDomainConflictPolicy;
     evidence?: AgentSignalFeedbackEvidence[];
     feedbackHint?: 'not_satisfied' | 'satisfied';
+    memoryLanguage?: string;
     message: string;
     reason?: string;
     serializedContext?: string;
     sourceHints?: AgentSignalFeedbackSourceHints;
+    sourceMessageId?: string;
     topicId?: string;
   }) => Promise<MemoryAgentActionResult>;
   pluginModel?: Pick<PluginModel, 'query'>;
@@ -123,46 +104,6 @@ const isUserMemoryAction = (action: BaseAction): action is ActionUserMemoryHandl
   return action.actionType === AGENT_SIGNAL_POLICY_ACTION_TYPES.userMemoryHandle;
 };
 
-const toMemoryWriterPrompt = (input: {
-  conflictPolicy?: AgentSignalFeedbackDomainConflictPolicy;
-  evidence?: AgentSignalFeedbackEvidence[];
-  feedbackHint?: 'not_satisfied' | 'satisfied';
-  message: string;
-  reason?: string;
-  serializedContext?: string;
-  sourceHints?: AgentSignalFeedbackSourceHints;
-}) => {
-  const feedbackHintBlock = input.feedbackHint
-    ? `Feedback satisfaction hint: ${input.feedbackHint}`
-    : undefined;
-  const domainReasonBlock = input.reason ? `Domain routing reason: ${input.reason}` : undefined;
-  const evidenceBlock =
-    input.evidence && input.evidence.length > 0
-      ? `Domain evidence:\n${JSON.stringify(input.evidence)}`
-      : undefined;
-  const sourceHintsBlock = input.sourceHints
-    ? `Source hints:\n${JSON.stringify(input.sourceHints)}`
-    : undefined;
-  const conflictPolicyBlock = input.conflictPolicy
-    ? `Conflict policy:\n${JSON.stringify(input.conflictPolicy)}`
-    : undefined;
-  const routingContextBlock = [
-    feedbackHintBlock,
-    domainReasonBlock,
-    evidenceBlock,
-    sourceHintsBlock,
-    conflictPolicyBlock,
-  ]
-    .filter(Boolean)
-    .join('\n\n');
-  const contextBlock = input.serializedContext?.trim()
-    ? `\n\nAdditional runtime context:\n${input.serializedContext}`
-    : '';
-  const hintBlock = routingContextBlock ? `\n\nRouting context:\n${routingContextBlock}` : '';
-
-  return `User feedback to analyze for durable memory:\n${input.message}${hintBlock}${contextBlock}`;
-};
-
 const createInitialContext = (operationId: string): AgentRuntimeContext => {
   return {
     payload: { message: [] },
@@ -181,33 +122,19 @@ const toManifestRecord = (manifestMap: Map<string, LobeToolManifest>) => {
 };
 
 const createFunctionCallSupportChecker = async () => {
-  const { LOBE_DEFAULT_MODEL_LIST } = await import('model-bank');
+  const { loadModels } = await import('@/business/client/model-bank/loadModels');
+  const builtinModels = await loadModels();
 
   return (model: string, provider: string) => {
-    const info = LOBE_DEFAULT_MODEL_LIST.find(
-      (item) => item.id === model && item.providerId === provider,
-    );
+    const info = builtinModels.find((item) => item.id === model && item.providerId === provider);
 
     return info?.abilities?.functionCall ?? true;
   };
 };
 
-const hasSuccessfulMemoryWrite = (state: AgentState) => {
-  const byTool = state.usage?.tools?.byTool ?? [];
-
-  return byTool.some(
-    (entry) => MEMORY_WRITE_TOOL_NAMES.has(entry.name) && entry.calls > entry.errors,
-  );
-};
-
-const hasFailedMemoryWrite = (state: AgentState) => {
-  const byTool = state.usage?.tools?.byTool ?? [];
-
-  return byTool.some(
-    (entry) =>
-      MEMORY_WRITE_TOOL_NAMES.has(entry.name) && entry.calls > 0 && entry.calls === entry.errors,
-  );
-};
+// Memory finalState parsing (tool-call/result walking, target resolution) lives
+// in ./memoryActionResult — kept dependency-light so the completion path can
+// reuse it without dragging this heavy module into its graph.
 
 export const runMemoryActionAgent = async (
   input: {
@@ -215,13 +142,30 @@ export const runMemoryActionAgent = async (
     conflictPolicy?: AgentSignalFeedbackDomainConflictPolicy;
     evidence?: AgentSignalFeedbackEvidence[];
     feedbackHint?: 'not_satisfied' | 'satisfied';
+    memoryLanguage?: string;
     message: string;
     reason?: string;
     serializedContext?: string;
     sourceHints?: AgentSignalFeedbackSourceHints;
+    /**
+     * The assistant message id that triggered this memory action.
+     * When provided together with topicId, a child thread is created
+     * under this message so that memory-agent messages are isolated
+     * from the main topic conversation.
+     */
+    sourceMessageId?: string;
     topicId?: string;
   },
   options: UserMemoryActionHandlerOptions,
+  /**
+   * When provided, the memory writer runs as an async (queued) execAgent run
+   * instead of a blocking `executeSync`: the operation is enqueued with the
+   * agent-signal marker stamped onto `appContext`, and the durable receipt is
+   * projected later on the completion path. Returns immediately with an
+   * `applied` (enqueued) status. Absent → the legacy synchronous path (still
+   * used by the self-iteration tool primitives until they migrate in S4).
+   */
+  dispatch?: { marker: AgentSignalOperationMarker },
 ): Promise<MemoryAgentActionResult> => {
   if (!input.agentId) {
     return {
@@ -233,6 +177,7 @@ export const runMemoryActionAgent = async (
   const agentService = options.agentService ?? new AgentService(options.db, options.userId);
   const pluginModel = options.pluginModel ?? new PluginModel(options.db, options.userId);
   const agentConfig = await agentService.getAgentConfig(input.agentId);
+  const memoryLanguage = input.memoryLanguage ?? 'English';
 
   if (!agentConfig?.model || !agentConfig?.provider) {
     return {
@@ -259,7 +204,7 @@ export const runMemoryActionAgent = async (
   const memoryRuntimeAgentConfig = {
     ...agentConfig,
     plugins: [MemoryIdentifier],
-    systemRole: MEMORY_WRITER_SYSTEM_ROLE,
+    systemRole: createAgentSignalMemoryWriterSystemRole({ memoryLanguage }),
   };
 
   const toolsEngine = createServerAgentToolsEngine(toolsContext, {
@@ -286,29 +231,39 @@ export const runMemoryActionAgent = async (
   const manifestMap = toolsEngine.getEnabledPluginManifests([MemoryIdentifier]);
   const operationId = `agent-signal-memory-${nanoid()}`;
   const initialContext = createInitialContext(operationId);
-  const streamEventManager = new InMemoryStreamEventManager();
   const { AgentRuntimeService } =
     await import('@/server/services/agentRuntime/AgentRuntimeService');
-  const runtimeService = new AgentRuntimeService(options.db, options.userId, {
-    coordinatorOptions: {
-      stateManager: new InMemoryAgentStateManager(),
-      streamEventManager,
-    },
-    queueService: null,
-    streamEventManager,
-  });
 
-  await runtimeService.createOperation({
+  // Create a child thread under the triggering assistant message so that
+  // memory-agent messages are isolated from the main topic conversation
+  // instead of being flattened into it.
+  let threadId: string | undefined;
+  if (input.topicId && input.sourceMessageId) {
+    try {
+      const threadModel = new ThreadModel(options.db, options.userId);
+      const thread = await threadModel.create({
+        agentId: input.agentId,
+        metadata: { operationId },
+        sourceMessageId: input.sourceMessageId,
+        title: 'Agent Signal Memory',
+        topicId: input.topicId,
+        type: ThreadType.Isolation,
+      });
+      threadId = thread?.id;
+    } catch {
+      // Non-fatal: fall back to writing into the main topic if thread creation fails.
+    }
+  }
+
+  const createParams = {
     agentConfig: memoryRuntimeAgentConfig,
-    appContext: {
-      agentId: input.agentId,
-      scope: 'chat',
-      topicId: input.topicId ?? null,
-      trigger: RequestTrigger.AgentSignal,
-    },
-    autoStart: false,
     initialContext,
-    initialMessages: [{ content: toMemoryWriterPrompt(input), role: 'user' }],
+    initialMessages: [
+      {
+        content: createAgentSignalMemoryWriterPrompt({ ...input, memoryLanguage }),
+        role: 'user',
+      },
+    ],
     modelRuntimeConfig: {
       model: agentConfig.model,
       provider: agentConfig.provider,
@@ -322,6 +277,46 @@ export const runMemoryActionAgent = async (
       tools: toolsResult.tools,
     },
     userId: options.userId,
+  };
+  const baseAppContext = {
+    agentId: input.agentId,
+    scope: 'chat',
+    sourceMessageId: input.sourceMessageId,
+    threadId: threadId ?? null,
+    topicId: input.topicId ?? null,
+    trigger: RequestTrigger.AgentSignal,
+  };
+
+  // Async (queued execAgent) path: enqueue the run with the marker stamped onto
+  // appContext (it lands in state.metadata.agentSignal), then return immediately.
+  // The durable receipt is projected on the completion path from the run's
+  // finalState — no blocking executeSync.
+  if (dispatch) {
+    const runtimeService = new AgentRuntimeService(options.db, options.userId);
+    await runtimeService.createOperation({
+      ...createParams,
+      appContext: { ...baseAppContext, agentSignal: dispatch.marker },
+      autoStart: true,
+      userInterventionConfig: { approvalMode: 'headless' },
+    });
+
+    return { detail: 'Memory write enqueued.', status: 'applied' };
+  }
+
+  // Legacy synchronous path (self-iteration tool primitives, until S4).
+  const streamEventManager = new InMemoryStreamEventManager();
+  const runtimeService = new AgentRuntimeService(options.db, options.userId, {
+    coordinatorOptions: {
+      stateManager: new InMemoryAgentStateManager(),
+      streamEventManager,
+    },
+    queueService: null,
+    streamEventManager,
+  });
+  await runtimeService.createOperation({
+    ...createParams,
+    appContext: baseAppContext,
+    autoStart: false,
     userInterventionConfig: { approvalMode: 'headless' },
   });
 
@@ -330,28 +325,7 @@ export const runMemoryActionAgent = async (
     maxSteps: MEMORY_AGENT_MAX_STEPS,
   });
 
-  if (finalState.status === 'error') {
-    return {
-      detail: 'Memory action agent finished with an error.',
-      status: 'failed',
-    };
-  }
-
-  if (hasSuccessfulMemoryWrite(finalState)) {
-    return { status: 'applied' };
-  }
-
-  if (hasFailedMemoryWrite(finalState)) {
-    return {
-      detail: 'Memory tool call failed during memory action agent execution.',
-      status: 'failed',
-    };
-  }
-
-  return {
-    detail: 'Memory action agent did not issue a durable memory write.',
-    status: 'skipped',
-  };
+  return resolveMemoryActionResultFromState(finalState);
 };
 
 export const handleUserMemoryAction = async (
@@ -418,21 +392,40 @@ export const handleUserMemoryAction = async (
         typeof action.payload.sourceHints === 'object' && action.payload.sourceHints
           ? action.payload.sourceHints
           : undefined,
+      // The assistant message that completed the turn — used to anchor the
+      // memory-agent child thread under that message instead of the main topic.
+      // Populated by planUserMemory via extractAssistantMessageIdFromSourceId;
+      // absent for non-clientRuntimeComplete sources where no assistant boundary exists.
+      sourceMessageId:
+        typeof action.payload.assistantMessageId === 'string'
+          ? action.payload.assistantMessageId
+          : undefined,
       topicId: typeof action.payload.topicId === 'string' ? action.payload.topicId : undefined,
     };
-    const runner = options.memoryActionRunner ?? ((input) => runMemoryActionAgent(input, options));
-    const memoryService = createMemoryMaintenanceService({
+    // Stamp the run so the completion path can project the memory receipt (the
+    // memory write is now enqueued async, not resolved synchronously here).
+    const marker: AgentSignalOperationMarker = {
+      kind: 'memory',
+      ...(runnerInput.sourceMessageId ? { anchorMessageId: runnerInput.sourceMessageId } : {}),
+      sourceId: idempotencyKey ?? action.actionId,
+      ...(runnerInput.topicId ? { topicId: runnerInput.topicId } : {}),
+    };
+    const runner =
+      options.memoryActionRunner ?? ((input) => runMemoryActionAgent(input, options, { marker }));
+    let memoryActionResult: MemoryAgentActionResult | undefined;
+    const memoryService = createMemoryService({
       writeMemory: async () => {
         const result = await runner(runnerInput);
+        memoryActionResult = result;
 
         if (result.status === 'applied') {
           return {
-            memoryId: idempotencyKey ?? action.actionId,
+            memoryId: result.target?.id ?? idempotencyKey ?? action.actionId,
             summary: result.detail,
           };
         }
 
-        throw new MemoryMaintenanceActionError(
+        throw new MemoryActionError(
           result.detail ?? 'Memory action agent did not apply a durable memory write.',
           result.status,
         );
@@ -451,9 +444,10 @@ export const handleUserMemoryAction = async (
       .then<MemoryAgentActionResult>((writeResult) => ({
         detail: writeResult.summary,
         status: 'applied',
+        ...(memoryActionResult?.target ? { target: memoryActionResult.target } : {}),
       }))
       .catch((error: unknown): MemoryAgentActionResult => {
-        if (error instanceof MemoryMaintenanceActionError) {
+        if (error instanceof MemoryActionError) {
           return {
             detail: error.message,
             status: error.status,
@@ -470,6 +464,7 @@ export const handleUserMemoryAction = async (
         actionId: action.actionId,
         attempt: finalizeAttempt(startedAt, 'succeeded'),
         detail: result.detail,
+        ...(result.target ? { output: { target: result.target } } : {}),
         status: 'applied',
       };
     }

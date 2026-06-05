@@ -1,3 +1,4 @@
+export { FOLDER_ICON_CSS, getExplorerTreeStyleVars } from './folderIconStyle';
 export type {
   ExplorerTreeCanDropCtx,
   ExplorerTreeHandle,

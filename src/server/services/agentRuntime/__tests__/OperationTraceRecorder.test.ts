@@ -349,6 +349,189 @@ describe('OperationTraceRecorder', () => {
     });
   });
 
+  describe('contextEngine dedup (via appendStep)', () => {
+    let store: ReturnType<typeof buildStore>;
+    let recorder: OperationTraceRecorder;
+
+    beforeEach(() => {
+      store = buildStore();
+      recorder = new OperationTraceRecorder(store as any);
+    });
+
+    const buildCe = (overrides: { input?: unknown; output?: unknown } = {}) => ({
+      input: { messages: ['hello'] },
+      output: { tokens: 42 },
+      ...overrides,
+    });
+
+    const appendStepWithCe = (
+      ce: { input?: unknown; output?: unknown },
+      prevStepsInStore: any[],
+    ) => {
+      store.loadPartial.mockResolvedValue({ startedAt: 1, steps: prevStepsInStore });
+      return recorder.appendStep('op-ce', {
+        afterStepSignalEvents: [],
+        agentState: { messages: [] },
+        beforeStepSignalEvents: [],
+        contextEngine: ce,
+        currentContext: { phase: 'user_input' },
+        externalRetryCount: 0,
+        presentation: buildPresentation(),
+        startedAt: 1000,
+        stepIndex: prevStepsInStore.length,
+        stepResult: {
+          events: [],
+          newState: { activatedStepTools: [], messages: [] },
+        },
+      });
+    };
+
+    const getSavedStep = (newStepIndex: number) => {
+      const saved = store.savePartial.mock.calls[0][1];
+      return saved.steps.find((s: any) => s.stepIndex === newStepIndex);
+    };
+
+    it('routes CE input/output into contextEngine, never into events', async () => {
+      await appendStepWithCe(buildCe(), []);
+
+      const step = getSavedStep(0);
+      // CE data lives in contextEngine, not events
+      expect(step.contextEngine).toBeDefined();
+      expect(step.events.some((e: any) => e.type === 'context_engine_result')).toBe(false);
+    });
+
+    it('keeps both input and output on the first step (no previous CE to compare against)', async () => {
+      await appendStepWithCe(buildCe(), []);
+
+      const step = getSavedStep(0);
+      expect(step.contextEngine.input).toEqual({ messages: ['hello'] });
+      expect(step.contextEngine.output).toEqual({ tokens: 42 });
+    });
+
+    it('strips both input and output when both are identical to the previous step', async () => {
+      const prevStep = {
+        contextEngine: { input: { messages: ['hello'] }, output: { tokens: 42 } },
+        stepIndex: 0,
+        stepType: 'call_llm',
+      };
+      await appendStepWithCe(buildCe(), [prevStep]);
+
+      const step = getSavedStep(1);
+      expect(step.contextEngine.input).toBeUndefined();
+      expect(step.contextEngine.output).toBeUndefined();
+    });
+
+    it('strips only input when input matches previous but output differs', async () => {
+      const prevStep = {
+        contextEngine: { input: { messages: ['hello'] }, output: { tokens: 42 } },
+        stepIndex: 0,
+        stepType: 'call_llm',
+      };
+      await appendStepWithCe(buildCe({ input: { messages: ['hello'] }, output: { tokens: 99 } }), [
+        prevStep,
+      ]);
+
+      const step = getSavedStep(1);
+      expect(step.contextEngine.input).toBeUndefined();
+      expect(step.contextEngine.output).toEqual({ tokens: 99 });
+    });
+
+    it('strips only output when output matches previous but input differs', async () => {
+      const prevStep = {
+        contextEngine: { input: { messages: ['hello'] }, output: { tokens: 42 } },
+        stepIndex: 0,
+        stepType: 'call_llm',
+      };
+      await appendStepWithCe(buildCe({ input: { messages: ['world'] }, output: { tokens: 42 } }), [
+        prevStep,
+      ]);
+
+      const step = getSavedStep(1);
+      expect(step.contextEngine.input).toEqual({ messages: ['world'] });
+      expect(step.contextEngine.output).toBeUndefined();
+    });
+
+    it('keeps both when both input and output differ from previous', async () => {
+      const prevStep = {
+        contextEngine: { input: { messages: ['old'] }, output: { tokens: 10 } },
+        stepIndex: 0,
+        stepType: 'call_llm',
+      };
+      await appendStepWithCe(buildCe({ input: { messages: ['new'] }, output: { tokens: 20 } }), [
+        prevStep,
+      ]);
+
+      const step = getSavedStep(1);
+      expect(step.contextEngine.input).toEqual({ messages: ['new'] });
+      expect(step.contextEngine.output).toEqual({ tokens: 20 });
+    });
+
+    it('walks back past intermediate steps without CE to find last stored values', async () => {
+      const prevSteps = [
+        {
+          contextEngine: { input: { messages: ['hello'] }, output: { tokens: 42 } },
+          stepIndex: 0,
+          stepType: 'call_llm',
+        },
+        // step 1 has no contextEngine — dedup must skip it and walk back to step 0
+        { stepIndex: 1, stepType: 'call_tool' },
+      ];
+      await appendStepWithCe(buildCe(), prevSteps);
+
+      const step = getSavedStep(2);
+      expect(step.contextEngine.input).toBeUndefined();
+      expect(step.contextEngine.output).toBeUndefined();
+    });
+
+    it('resolves input and output independently from different previous steps', async () => {
+      // step 0 stored only input (output was stripped vs its own predecessor)
+      // step 1 stored only output (input was stripped vs step 0)
+      // New step 2 has the same input as step 0 and same output as step 1 → both deduped
+      const prevSteps = [
+        { contextEngine: { input: { messages: ['hello'] } }, stepIndex: 0, stepType: 'call_llm' },
+        { contextEngine: { output: { tokens: 42 } }, stepIndex: 1, stepType: 'call_llm' },
+      ];
+      await appendStepWithCe(
+        buildCe({ input: { messages: ['hello'] }, output: { tokens: 42 } }),
+        prevSteps,
+      );
+
+      const step = getSavedStep(2);
+      expect(step.contextEngine.input).toBeUndefined();
+      expect(step.contextEngine.output).toBeUndefined();
+    });
+
+    it('sets contextEngine to undefined when no CE was recorded for the step', async () => {
+      const prevStep = {
+        contextEngine: { input: { messages: ['hello'] }, output: { tokens: 42 } },
+        stepIndex: 0,
+        stepType: 'call_llm',
+      };
+      store.loadPartial.mockResolvedValue({ startedAt: 1, steps: [prevStep] });
+
+      await recorder.appendStep('op-ce', {
+        afterStepSignalEvents: [],
+        agentState: { messages: [] },
+        beforeStepSignalEvents: [],
+        currentContext: { phase: 'tool_result' },
+        externalRetryCount: 0,
+        presentation: buildPresentation({ stepType: 'call_tool' }),
+        startedAt: 1000,
+        stepIndex: 1,
+        stepResult: {
+          events: [{ type: 'tool_result', id: 'tc-1' }],
+          newState: { activatedStepTools: [], messages: [] },
+        },
+      });
+
+      const saved = store.savePartial.mock.calls[0][1];
+      const newStep = saved.steps.find((s: any) => s.stepIndex === 1);
+      expect(newStep.contextEngine).toBeUndefined();
+      expect(newStep.events.some((e: any) => e.type === 'context_engine_result')).toBe(false);
+      expect(newStep.events.some((e: any) => e.type === 'tool_result')).toBe(true);
+    });
+  });
+
   describe('store=null (snapshot tracing disabled)', () => {
     it('appendStep is a no-op', async () => {
       const recorder = new OperationTraceRecorder(null);
